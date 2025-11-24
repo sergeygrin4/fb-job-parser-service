@@ -1,197 +1,267 @@
-# fb_parser.py
 import os
 import time
+import json
 import logging
-import hashlib
+from datetime import datetime
+from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
-from facebook_scraper import get_posts
 import requests
+from facebook_scraper import get_posts
+from requests.exceptions import HTTPError, RequestException
 
+# ----------------- ЛОГИ -----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - fb_parser - %(levelname)s - %(message)s",
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger("fb_parser")
 
-# ====================== ENV ======================
+# ----------------- КОНФИГ ЧЕРЕЗ ENV -----------------
+API_BASE_URL = os.getenv("API_BASE_URL")  # например: https://miniapp-tg-production.up.railway.app
+API_SECRET = os.getenv("API_SECRET", "mvp-secret-key-2024")
 
-# URL миниаппа, например:
-# https://job-miniapp-service-production.up.railway.app
-API_BASE_URL = os.getenv("API_BASE_URL")
+# Ключевые слова для поиска (через запятую), если не задано — дефолтный список
+KEYWORDS_ENV = os.getenv(
+    "KEYWORDS",
+    "вакансия,работа,job,hiring,remote,developer,программист",
+)
+KEYWORDS: List[str] = [k.strip().lower() for k in KEYWORDS_ENV.split(",") if k.strip()]
 
-# Должен совпадать с API_SECRET в миниаппе
-API_SECRET = os.getenv("API_SECRET", "mvp-secret-key-2024-xyz")
+# Куки для Facebook в JSON-формате в переменной FB_COOKIES_JSON
+# пример:
+# {"c_user": "...", "xs": "...", ...}
+FB_COOKIES_JSON = os.getenv("FB_COOKIES_JSON")
+COOKIES: Optional[Dict[str, str]] = None
+if FB_COOKIES_JSON:
+    try:
+        COOKIES = json.loads(FB_COOKIES_JSON)
+    except json.JSONDecodeError:
+        log.error("❌ Не могу распарсить FB_COOKIES_JSON — проверь формат JSON")
+        COOKIES = None
 
-JOB_KEYWORDS = [
-    kw.strip().lower()
-    for kw in os.getenv(
-        "JOB_KEYWORDS",
-        "вакансия,работа,job,hiring,remote,developer,программист,amazon",
-    ).split(",")
-    if kw.strip()
-]
-
-CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "5"))
-MAX_POSTS_PER_GROUP = int(os.getenv("MAX_POSTS_PER_GROUP", "20"))
-
-# Сырые cookies строкой, если нужно парсить закрытые/приватные группы:
-# "key1=value1; key2=value2; ..."
-FACEBOOK_COOKIES = os.getenv("FACEBOOK_COOKIES")
+if not API_BASE_URL:
+    log.error("❌ Не задан API_BASE_URL — без него парсер не знает, куда слать вакансии")
+    # но не выходим, вдруг кто-то поставит потом
 
 
-# ====================== Вспомогалки ======================
-
-def get_cookies_dict():
+# ----------------- УТИЛИТЫ -----------------
+def normalize_group_identifier(group_link: str) -> Optional[str]:
     """
-    Простой разбор cookies формата "key1=value1; key2=value2"
+    Превращает ссылку/имя группы в то, что нужно передать в facebook_scraper.get_posts(group=...).
+
+    Примеры:
+      "https://www.facebook.com/groups/ProjectAmazon" -> "ProjectAmazon"
+      "https://facebook.com/groups/123456789"        -> "123456789"
+      "ProjectAmazon"                                -> "ProjectAmazon"
     """
-    if not FACEBOOK_COOKIES:
+    if not group_link:
         return None
-    cookies: dict[str, str] = {}
-    for part in FACEBOOK_COOKIES.split(";"):
-        part = part.strip()
-        if not part or "=" not in part:
-            continue
-        k, v = part.split("=", 1)
-        cookies[k.strip()] = v.strip()
-    return cookies
 
+    group_link = group_link.strip()
 
-def get_fb_groups():
-    """
-    Тянем список FB-групп из miniapp-сервиса.
-    GET {API_BASE_URL}/api/groups
-    """
-    if not API_BASE_URL:
-        raise RuntimeError("API_BASE_URL is not set")
-
-    url = f"{API_BASE_URL.rstrip('/')}/api/groups"
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-
-    groups: list[tuple[str, str]] = []
-    for g in data.get("groups", []):
-        if g.get("enabled"):
-            groups.append((g["group_id"], g["group_name"]))
-    return groups
-
-
-def text_matches_keywords(text: str) -> bool:
-    t = (text or "").lower()
-    return any(kw in t for kw in JOB_KEYWORDS)
-
-
-def build_external_id(group_id: str, post_id: str) -> str:
-    # На всякий случай нормализуем
-    raw = f"fb:{group_id}:{post_id}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def send_job(group_name: str, group_link: str, post: dict) -> None:
-    """
-    Отправка вакансии в miniapp /post
-    """
-    if not API_BASE_URL:
-        raise RuntimeError("API_BASE_URL is not set")
-
-    post_id = post.get("post_id") or post.get("post_url") or ""
-    text = post.get("text") or ""
-    post_url = post.get("post_url") or group_link
-
-    external_id = build_external_id(group_link, str(post_id))
-
-    created_at = None
-    if post.get("time"):
-        try:
-            created_at = post["time"].isoformat()
-        except Exception:
-            created_at = None
-
-    payload = {
-        "source": "facebook",
-        "source_name": group_name,
-        "external_id": external_id,
-        "url": post_url,
-        "text": text,
-        "created_at": created_at,
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "X-API-KEY": API_SECRET,
-    }
-
-    resp = requests.post(
-        f"{API_BASE_URL.rstrip('/')}/post",
-        json=payload,
-        headers=headers,
-        timeout=30,
-    )
-    if resp.status_code == 200:
-        data = resp.json()
-        if data.get("status") == "duplicate":
-            log.info("🔁 Уже есть такой пост: %s", external_id)
-        else:
-            log.info("✅ Новая вакансия отправлена: %s", external_id)
-    else:
-        log.error("❌ Ошибка отправки вакансии: %s %s", resp.status_code, resp.text)
-
-
-def parse_group(group_link: str, group_name: str, cookies: dict | None):
-    """
-    Парсинг одной группы.
-    group_link — то, что хранится в fb_groups.group_id (может быть и полноценная ссылка).
-    """
-    log.info("🔍 Парсим группу: %s (%s)", group_name, group_link)
+    # Если просто ID или имя
+    if not group_link.startswith("http://") and not group_link.startswith("https://"):
+        return group_link.strip("/")
 
     parsed = urlparse(group_link)
-    group = parsed.path.strip("/") or group_link
+    path = (parsed.path or "").strip("/")  # "groups/ProjectAmazon" или "groups/123456789"
+
+    parts = path.split("/")
+    # Ожидаемый вариант: ["groups", "ProjectAmazon"]
+    if len(parts) >= 2 and parts[0] == "groups":
+        return parts[1]
+
+    # На всякий случай — берём последний сегмент
+    if parts:
+        return parts[-1]
+
+    return None
+
+
+def matches_keywords(text: str) -> bool:
+    """
+    Проверка, содержит ли текст хотя бы одно из ключевых слов.
+    """
+    if not text:
+        return False
+    lower = text.lower()
+    return any(k in lower for k in KEYWORDS)
+
+
+# ----------------- РАБОТА С API МИНИАППА -----------------
+def get_fb_groups() -> List[Dict]:
+    """
+    Забираем список групп из миниаппа: GET {API_BASE_URL}/api/groups
+    Ожидаем ответ: {"groups": [ { "group_id": "...", "group_name": "...", "enabled": true }, ... ]}
+    """
+    if not API_BASE_URL:
+        log.error("❌ API_BASE_URL не задан, не могу получить список групп.")
+        return []
+
+    url = API_BASE_URL.rstrip("/") + "/api/groups"
+    log.info(f"API групп: {url}")
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+    except RequestException as e:
+        log.error(f"❌ Не удалось получить группы: {e}")
+        return []
+
+    try:
+        data = resp.json()
+    except ValueError:
+        log.error("❌ Невалидный JSON при получении групп")
+        return []
+
+    groups = data.get("groups") or []
+    active = [g for g in groups if g.get("enabled")]
+    log.info(f"Найдено {len(active)} активных групп")
+    return active
+
+
+def send_job_to_api(
+    source: str,
+    source_name: str,
+    external_id: str,
+    url: Optional[str],
+    text: str,
+    created_at: Optional[datetime],
+) -> None:
+    """
+    Шлём вакансию в миниапп: POST {API_BASE_URL}/post с X-API-KEY.
+    Формат согласован с backend’ом миниаппа.
+    """
+    if not API_BASE_URL:
+        log.error("❌ API_BASE_URL не задан, не могу отправить вакансию")
+        return
+
+    endpoint = API_BASE_URL.rstrip("/") + "/post"
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if API_SECRET:
+        headers["X-API-KEY"] = API_SECRET
+
+    payload = {
+        "source": source,  # "facebook"
+        "source_name": source_name,
+        "external_id": external_id,
+        "url": url,
+        "text": text,
+        "created_at": created_at.isoformat() if created_at else None,
+    }
+
+    try:
+        resp = requests.post(endpoint, headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        status = data.get("status")
+        if status == "duplicate":
+            log.info(f"🔁 Дубликат вакансии {external_id} ({source_name})")
+        else:
+            log.info(f"✅ Вакансия отправлена в API ({source_name} / {external_id})")
+    except RequestException as e:
+        log.error(f"❌ Ошибка отправки вакансии в API: {e}")
+
+
+# ----------------- ПАРСИНГ ОДНОЙ ГРУППЫ -----------------
+def parse_group(group_link: str, group_name: str, cookies: Optional[Dict]) -> int:
+    """
+    Парсим одну группу, фильтруем по ключевым словам, отправляем вакансии в миниапп.
+    Возвращает количество обработанных постов (после фильтра).
+    """
+    log.info(f"🔍 Парсим группу: {group_name} ({group_link})")
+
+    group = normalize_group_identifier(group_link)
+    if not group:
+        log.error(f"❌ Не удалось нормализовать group из {group_link}")
+        return 0
+
+    log.info(f"Используем идентификатор группы для facebook_scraper: {group}")
 
     count = 0
-    for post in get_posts(
-        group=group,
-        pages=1,
-        cookies=cookies,
-        options={"allow_extra_requests": False},
-    ):
-        text = post.get("text") or ""
-        if not text_matches_keywords(text):
-            continue
 
-        send_job(group_name, group_link, post)
-        count += 1
+    try:
+        # pages можно увеличить, если нужно больше постов
+        for post in get_posts(
+            group=group,
+            pages=1,
+            cookies=cookies,
+            options={"allow_extra_requests": False},
+        ):
+            text = post.get("text") or ""
+            if not matches_keywords(text):
+                continue
 
-        if count >= MAX_POSTS_PER_GROUP:
-            break
+            post_id = post.get("post_id") or ""
+            external_id = str(post_id) if post_id else (
+                post.get("post_url") or post.get("link") or text[:30]
+            )
 
-    log.info("📌 Для %s найдено %s постов по ключевым словам", group_name, count)
+            post_url = post.get("post_url") or post.get("link")
+            created_at = post.get("time")  # обычно datetime или None
+
+            send_job_to_api(
+                source="facebook",
+                source_name=group_name,
+                external_id=external_id,
+                url=post_url,
+                text=text,
+                created_at=created_at,
+            )
+            count += 1
+
+    except HTTPError as e:
+        log.error(f"❌ HTTPError при запросе группы {group_link}: {e}")
+    except Exception as e:
+        log.error(f"❌ Неожиданная ошибка при парсинге {group_link}: {e}")
+
+    log.info(f"📦 Обработано {count} постов для группы {group_name}")
     return count
 
 
+# ----------------- ОСНОВНОЙ ЦИКЛ -----------------
 def run_loop():
-    cookies = get_cookies_dict()
+    """
+    Один цикл парсинга:
+      1) забираем активные группы из миниаппа
+      2) обходим по очереди
+      3) отправляем вакансии
+    """
+    if not API_BASE_URL:
+        log.error("❌ API_BASE_URL не задан — останавливаю цикл")
+        return
+
+    log.info(f"API: {API_BASE_URL}")
+    log.info(f"Ключевые слова: {KEYWORDS}")
+    if COOKIES:
+        log.info("Cookies загружены из FB_COOKIES_JSON")
+    else:
+        log.warning("⚠️ Cookies НЕ заданы — Facebook скорее всего вернёт капчу/логин")
+
+    groups = get_fb_groups()
+    total_posts = 0
+
+    for g in groups:
+        group_link = g.get("group_id") or ""
+        group_name = g.get("group_name") or group_link
+        total_posts += parse_group(group_link, group_name, COOKIES)
+
+    log.info(f"✅ Цикл завершён. Всего обработано постов: {total_posts}")
+
+
+def main():
     log.info("🚀 Запуск Facebook Job Parser")
-    log.info("Ключевые слова: %s", JOB_KEYWORDS)
 
     while True:
         try:
-            groups = get_fb_groups()
-            log.info("Найдено %s активных групп", len(groups))
-
-            total_posts = 0
-            for group_link, group_name in groups:
-                total_posts += parse_group(group_link, group_name, cookies)
-                time.sleep(2)
-
-            log.info("✅ Цикл завершён. Обработано %s постов", total_posts)
+            run_loop()
         except Exception as e:
-            log.exception("❌ Ошибка в основном цикле: %s", e)
-
-        log.info("⏳ Ожидание %s минут...", CHECK_INTERVAL_MINUTES)
-        time.sleep(CHECK_INTERVAL_MINUTES * 60)
+            log.error(f"❌ Ошибка в основном цикле: {e}")
+        log.info("⏳ Ожидание 5 минут...")
+        time.sleep(300)
 
 
 if __name__ == "__main__":
-    run_loop()
+    main()
