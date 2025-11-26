@@ -18,7 +18,9 @@ logging.basicConfig(
 log = logging.getLogger("fb_parser")
 
 # ----------------- КОНФИГ ЧЕРЕЗ ENV -----------------
-API_BASE_URL = os.getenv("API_BASE_URL")  # например: https://miniapp-tg-production.up.railway.app
+
+# например: https://miniapptg-production-caaa.up.railway.app
+API_BASE_URL = os.getenv("API_BASE_URL")
 API_SECRET = os.getenv("API_SECRET", "mvp-secret-key-2024")
 
 # Ключевые слова для поиска (через запятую), если не задано — дефолтный список
@@ -36,16 +38,20 @@ COOKIES: Optional[Dict[str, str]] = None
 if FB_COOKIES_JSON:
     try:
         COOKIES = json.loads(FB_COOKIES_JSON)
+        log.info("Cookies загружены из FB_COOKIES_JSON")
     except json.JSONDecodeError:
         log.error("❌ Не могу распарсить FB_COOKIES_JSON — проверь формат JSON")
         COOKIES = None
+else:
+    log.warning("⚠️ FB_COOKIES_JSON не задан — Facebook, скорее всего, покажет капчу/логин")
 
 if not API_BASE_URL:
     log.error("❌ Не задан API_BASE_URL — без него парсер не знает, куда слать вакансии")
     # но не выходим, вдруг кто-то поставит потом
 
-
 # ----------------- УТИЛИТЫ -----------------
+
+
 def normalize_group_identifier(group_link: str) -> Optional[str]:
     """
     Превращает ссылку/имя группы в то, что нужно передать в facebook_scraper.get_posts(group=...).
@@ -90,10 +96,17 @@ def matches_keywords(text: str) -> bool:
 
 
 # ----------------- РАБОТА С API МИНИАППА -----------------
+
+
 def get_fb_groups() -> List[Dict]:
     """
     Забираем список групп из миниаппа: GET {API_BASE_URL}/api/groups
-    Ожидаем ответ: {"groups": [ { "group_id": "...", "group_name": "...", "enabled": true }, ... ]}
+
+    Миниапп возвращает и Facebook, и Telegram источники в одной таблице fb_groups.
+    Здесь мы оставляем ТОЛЬКО Facebook-группы:
+
+      - group_id содержит 'facebook.com' или 'fb.com'
+      - при этом НЕ содержит 't.me' (телега) и 'telegram.me'.
     """
     if not API_BASE_URL:
         log.error("❌ API_BASE_URL не задан, не могу получить список групп.")
@@ -114,10 +127,35 @@ def get_fb_groups() -> List[Dict]:
         log.error("❌ Невалидный JSON при получении групп")
         return []
 
-    groups = data.get("groups") or []
-    active = [g for g in groups if g.get("enabled")]
-    log.info(f"Найдено {len(active)} активных групп")
-    return active
+    all_groups = data.get("groups") or []
+
+    # Сначала берём только enabled = true
+    enabled_groups: List[Dict] = [g for g in all_groups if g.get("enabled")]
+
+    fb_groups: List[Dict] = []
+    skipped_non_fb: List[str] = []
+
+    for g in enabled_groups:
+        gid = (g.get("group_id") or "").strip()
+        low = gid.lower()
+        # Телеграм-источники отдаем на съедение tg_parser'у
+        if "t.me/" in low or "telegram.me" in low:
+            skipped_non_fb.append(gid)
+            continue
+        # Оставляем только URL/идентификаторы, в которых явно видно facebook/fb
+        if "facebook.com" in low or "fb.com" in low:
+            fb_groups.append(g)
+        else:
+            # всё остальное тоже игнорируем (на будущее)
+            skipped_non_fb.append(gid)
+
+    log.info(
+        f"Всего групп из API: {len(all_groups)}; активных: {len(enabled_groups)}; facebook-групп: {len(fb_groups)}"
+    )
+    if skipped_non_fb:
+        log.info(f"Пропущены не-facebook источники: {skipped_non_fb}")
+
+    return fb_groups
 
 
 def send_job_to_api(
@@ -146,7 +184,7 @@ def send_job_to_api(
     payload = {
         "source": source,  # "facebook"
         "source_name": source_name,
-        "external_id": external_id,
+        "external_id": str(external_id),
         "url": url,
         "text": text,
         "created_at": created_at.isoformat() if created_at else None,
@@ -165,7 +203,9 @@ def send_job_to_api(
         log.error(f"❌ Ошибка отправки вакансии в API: {e}")
 
 
-# ----------------- ПАРСИНГ ОДНОЙ ГРУППЫ -----------------
+# ----------------- ПАРСИНГ ОДНОЙ ГРУППЫ ---------------
+
+
 def parse_group(group_link: str, group_name: str, cookies: Optional[Dict]) -> int:
     """
     Парсим одну группу, фильтруем по ключевым словам, отправляем вакансии в миниапп.
@@ -222,10 +262,12 @@ def parse_group(group_link: str, group_name: str, cookies: Optional[Dict]) -> in
 
 
 # ----------------- ОСНОВНОЙ ЦИКЛ -----------------
+
+
 def run_loop():
     """
     Один цикл парсинга:
-      1) забираем активные группы из миниаппа
+      1) забираем активные FB-группы из миниаппа
       2) обходим по очереди
       3) отправляем вакансии
     """
