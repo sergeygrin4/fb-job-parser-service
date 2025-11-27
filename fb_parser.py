@@ -37,10 +37,12 @@ POSTS_PER_GROUP = int(os.getenv("POSTS_PER_GROUP", "20"))
 FB_COOKIES_JSON = os.getenv("FB_COOKIES_JSON", "")
 FB_USER_AGENT = os.getenv(
     "FB_USER_AGENT",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    # Мобильный Chrome под Android, чтобы FB не редиректил на десктоп
+    "Mozilla/5.0 (Linux; Android 10; SM-G973F) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0 Safari/537.36",
+    "Chrome/120.0 Mobile Safari/537.36",
 )
+
 
 
 # ----------------- КУКИ -----------------
