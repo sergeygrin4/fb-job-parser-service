@@ -24,7 +24,6 @@ log = logging.getLogger("fb_parser")
 API_BASE_URL = (os.getenv("API_BASE_URL") or "").rstrip("/")
 API_SECRET = os.getenv("API_SECRET", "mvp-secret-key-2024")
 
-# Ключевые слова (через запятую)
 KEYWORDS_ENV = os.getenv(
     "KEYWORDS",
     "вакансия,работа,job,hiring,remote,developer,программист",
@@ -35,14 +34,17 @@ CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "5"))
 POSTS_PER_GROUP = int(os.getenv("POSTS_PER_GROUP", "20"))
 
 FB_COOKIES_JSON = os.getenv("FB_COOKIES_JSON", "")
+
+# будем притворяться мобильным браузером
 FB_USER_AGENT = os.getenv(
     "FB_USER_AGENT",
-    # Мобильный Chrome под Android, чтобы FB не редиректил на десктоп
     "Mozilla/5.0 (Linux; Android 10; SM-G973F) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0 Mobile Safari/537.36",
+    "Chrome/120.0.0.0 Mobile Safari/537.36",
 )
 
+# старый добрый HTML-режим
+FB_BASIC_HOST = os.getenv("FB_BASIC_HOST", "mbasic.facebook.com")
 
 
 # ----------------- КУКИ -----------------
@@ -50,7 +52,7 @@ FB_USER_AGENT = os.getenv(
 
 def load_cookies() -> Optional[Dict[str, str]]:
     """
-    Читает FB_COOKIES_JSON. Поддерживает оба формата:
+    Читает FB_COOKIES_JSON. Поддерживает:
       1) {"c_user": "...", "xs": "...", ...}
       2) [{"name": "c_user", "value": "...", ...}, ...]
     Возвращает dict name -> value.
@@ -92,6 +94,7 @@ def create_fb_session(cookies: Optional[Dict[str, str]]) -> requests.Session:
         {
             "User-Agent": FB_USER_AGENT,
             "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
     )
     if cookies:
@@ -104,25 +107,10 @@ def create_fb_session(cookies: Optional[Dict[str, str]]) -> requests.Session:
 
 def get_fb_groups() -> List[Dict]:
     """
-    Забираем список групп из миниаппа: GET {API_BASE_URL}/api/groups.
+    GET {API_BASE_URL}/api/groups
 
-    Формат ответа:
-      {
-        "groups": [
-          {
-            "id": ...,
-            "group_id": "https://www.facebook.com/groups/ProjectAmazon",
-            "group_name": "...",
-            "enabled": true
-          },
-          ...
-        ]
-      }
-
-    Здесь мы оставляем ТОЛЬКО активные facebook-группы:
-      - enabled = true
-      - group_id содержит facebook.com или fb.com
-      - и не содержит t.me / telegram.me
+    Берём только enabled = true и только facebook.com / fb.com.
+    t.me/telegram.me пропускаем (их ест tg_parser).
     """
     if not API_BASE_URL:
         log.error("❌ API_BASE_URL не задан — не могу получить список групп.")
@@ -154,12 +142,10 @@ def get_fb_groups() -> List[Dict]:
         gid = (g.get("group_id") or "").strip()
         low = gid.lower()
 
-        # Телеграм — пропускаем (их заберёт tg_parser)
         if "t.me/" in low or "telegram.me" in low:
             skipped_non_fb.append(gid)
             continue
 
-        # Оставляем только URL/идентификаторы, где явно видно facebook / fb
         if "facebook.com" in low or "fb.com" in low:
             fb_groups.append(g)
         else:
@@ -177,26 +163,24 @@ def get_fb_groups() -> List[Dict]:
 # ----------------- УТИЛИТЫ -----------------
 
 
-def normalize_group_link_to_mobile(group_link: str) -> str:
+def normalize_group_link_to_basic(group_link: str) -> str:
     """
     Делает из https://www.facebook.com/groups/ProjectAmazon
-    → https://m.facebook.com/groups/ProjectAmazon
+    → https://mbasic.facebook.com/groups/ProjectAmazon
+
+    Если прилетело просто "ProjectAmazon" или "187743251645949" — собираем сами.
     """
-    group_link = group_link.strip()
-    if not group_link.startswith("http"):
-        # если вдруг кто-то засунул просто ID/имя, соберём сами
-        return f"https://m.facebook.com/groups/{group_link}"
+    group_link = (group_link or "").strip()
+    if not group_link:
+        return f"https://{FB_BASIC_HOST}/groups"
+
+    if not group_link.startswith("http://") and not group_link.startswith("https://"):
+        return f"https://{FB_BASIC_HOST}/groups/{group_link}"
 
     parsed = urlparse(group_link)
-    host = parsed.netloc
     path = parsed.path or "/"
-
-    # нормализуем хост на m.facebook.com
-    if "facebook.com" in host and not host.startswith("m.facebook.com"):
-        host = "m.facebook.com"
-
-    mobile_url = f"https://{host}{path}"
-    return mobile_url
+    # path уже типа "/groups/ProjectAmazon" — просто меняем хост
+    return f"https://{FB_BASIC_HOST}{path}"
 
 
 def matches_keywords(text: str) -> bool:
@@ -206,51 +190,62 @@ def matches_keywords(text: str) -> bool:
     return any(k in low for k in KEYWORDS)
 
 
-# ----------------- ПАРСИНГ m.facebook.com -----------------
+# ----------------- ПАРСИНГ mbasic.facebook.com -----------------
 
 
-def fetch_group_html(session: requests.Session, mobile_url: str) -> Optional[str]:
+def fetch_group_html(session: requests.Session, basic_url: str) -> Optional[str]:
     try:
-        log.info(f"🔎 Загружаю мобильную группу: {mobile_url}")
-        resp = session.get(mobile_url, timeout=30)
+        log.info(f"🔎 Загружаю basic-группу: {basic_url}")
+        # не даём requests сразу редиректить нас на www.facebook.com
+        resp = session.get(basic_url, timeout=30, allow_redirects=False)
+    except RequestException as e:
+        log.error(f"❌ Ошибка сети при запросе {basic_url}: {e}")
+        return None
+
+    # Если нас пытаются унести на десктоп — логируем и не идём дальше
+    if 300 <= resp.status_code < 400:
+        loc = resp.headers.get("Location", "")
+        log.warning(
+            f"⚠️ Получен редирект {resp.status_code} с {resp.url} на {loc} — "
+            f"Facebook не хочет отдавать basic-страницу"
+        )
+        return None
+
+    try:
         resp.raise_for_status()
     except HTTPError as e:
-        log.error(f"❌ HTTP ошибка при запросе {mobile_url}: {e}")
-        return None
-    except RequestException as e:
-        log.error(f"❌ Ошибка сети при запросе {mobile_url}: {e}")
+        log.error(f"❌ HTTP ошибка при запросе {basic_url}: {e} (url={resp.url})")
         return None
 
     return resp.text
 
 
-def extract_posts_from_mobile_html(html: str, base_url: str) -> List[Tuple[str, Optional[str], Optional[datetime]]]:
+def extract_posts_from_basic_html(
+    html: str, base_url: str
+) -> List[Tuple[str, Optional[str], Optional[datetime]]]:
     """
-    Очень грубый мобильный парсер:
+    Грубый парсер mbasic.facebook.com:
 
-    - ищем блоки-посты по нескольким эвристикам:
+    - ищем блоки с постами:
         * article
         * div[data-ft][role=article]
         * div с id, похожим на "m_story"
-    - собираем текст поста
-    - пытаемся найти permalink
-    - вытаскиваем время из abbr[data-utime] / span[data-utime]
+    - достаём текст, permalink, timestamp (если есть)
     """
     soup = BeautifulSoup(html, "lxml")
     posts: List[Tuple[str, Optional[str], Optional[datetime]]] = []
 
-    # 1) article
     containers = soup.find_all("article")
 
-    # 2) div[data-ft][role=article]
     if not containers:
         containers = soup.find_all("div", attrs={"data-ft": True, "role": "article"})
 
-    # 3) любые div с data-ft
     if not containers:
-        containers = soup.find_all("div", attrs={"data-ft": True})
+        containers = [
+            d
+            for d in soup.find_all("div", attrs={"data-ft": True})
+        ]
 
-    # 4) последний шанс — div, id которых выглядит как story
     if not containers:
         containers = [
             d
@@ -259,7 +254,7 @@ def extract_posts_from_mobile_html(html: str, base_url: str) -> List[Tuple[str, 
         ]
 
     if not containers:
-        log.warning("⚠️ Не удалось найти контейнеры постов в мобильном HTML")
+        log.warning("⚠️ Не удалось найти контейнеры постов в basic HTML")
         return posts
 
     for block in containers[:POSTS_PER_GROUP]:
@@ -267,7 +262,6 @@ def extract_posts_from_mobile_html(html: str, base_url: str) -> List[Tuple[str, 
         if not text:
             continue
 
-        # permalink
         post_url: Optional[str] = None
         for a in block.find_all("a", href=True):
             href = a["href"]
@@ -275,7 +269,6 @@ def extract_posts_from_mobile_html(html: str, base_url: str) -> List[Tuple[str, 
                 post_url = urljoin(base_url, href.split("?", 1)[0])
                 break
 
-        # время
         created_at: Optional[datetime] = None
         abbr = block.find("abbr")
         if abbr and abbr.has_attr("data-utime"):
@@ -295,11 +288,11 @@ def extract_posts_from_mobile_html(html: str, base_url: str) -> List[Tuple[str, 
 
         posts.append((text, post_url, created_at))
 
-    log.info(f"📄 Найдено {len(posts)} потенциальных постов в мобильном HTML")
+    log.info(f"📄 Найдено {len(posts)} потенциальных постов в basic HTML")
     return posts
 
 
-# ----------------- ОТПРАВКА ВАКАНСИЙ В МИНИАПП -----------------
+# ----------------- ОТПРАВКА ВАКАНСИЙ -----------------
 
 
 def send_job_to_api(
@@ -314,9 +307,7 @@ def send_job_to_api(
         return
 
     endpoint = f"{API_BASE_URL}/post"
-    headers = {
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
     if API_SECRET:
         headers["X-API-KEY"] = API_SECRET
 
@@ -350,24 +341,20 @@ def parse_one_group(
     group_link: str,
     group_name: str,
 ) -> int:
-    """
-    Возвращает количество отправленных вакансий.
-    """
-    mobile_url = normalize_group_link_to_mobile(group_link)
-    log.info(f"🔍 Парсим группу: {group_name} ({group_link}) → {mobile_url}")
+    basic_url = normalize_group_link_to_basic(group_link)
+    log.info(f"🔍 Парсим группу: {group_name} ({group_link}) → {basic_url}")
 
-    html = fetch_group_html(session, mobile_url)
+    html = fetch_group_html(session, basic_url)
     if not html:
         return 0
 
-    posts = extract_posts_from_mobile_html(html, base_url="https://m.facebook.com")
+    posts = extract_posts_from_basic_html(html, base_url=f"https://{FB_BASIC_HOST}")
     sent = 0
 
     for text, post_url, created_at in posts:
         if not matches_keywords(text):
             continue
 
-        # формируем external_id из источника + ссылки или куска текста
         base = group_link.split("?", 1)[0]
         ext = f"{base}|{post_url or text[:50]}"
         external_id = str(abs(hash(ext)))
@@ -415,8 +402,7 @@ def run_once():
 
 
 def main():
-    log.info("🚀 Запуск Facebook Job Parser (мобильный m.facebook.com)")
-
+    log.info("🚀 Запуск Facebook Job Parser (mbasic.facebook.com)")
     while True:
         try:
             run_once()
