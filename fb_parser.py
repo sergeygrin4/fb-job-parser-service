@@ -2,406 +2,276 @@ import os
 import time
 import json
 import logging
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse, urljoin
+from datetime import date
+from typing import List, Dict, Any
 
 import requests
-from bs4 import BeautifulSoup
-from requests.exceptions import RequestException, HTTPError
-
-# ----------------- ЛОГИ -----------------
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - fb_parser - %(levelname)s - %(message)s",
 )
-log = logging.getLogger("fb_parser")
+logger = logging.getLogger("fb_parser")
 
-
-# ----------------- КОНФИГ -----------------
+# ---------- КОНФИГ ----------
 
 API_BASE_URL = (os.getenv("API_BASE_URL") or "").rstrip("/")
-API_SECRET = os.getenv("API_SECRET", "mvp-secret-key-2024")
+if not API_BASE_URL:
+    raise RuntimeError("API_BASE_URL is not set")
 
-KEYWORDS_ENV = os.getenv(
-    "KEYWORDS",
-    "вакансия,работа,job,hiring,remote,developer,программист",
-)
-KEYWORDS: List[str] = [k.strip().lower() for k in KEYWORDS_ENV.split(",") if k.strip()]
+API_SECRET = os.getenv("API_SECRET", "")
 
-CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "5"))
-POSTS_PER_GROUP = int(os.getenv("POSTS_PER_GROUP", "20"))
-
-FB_COOKIES_JSON = os.getenv("FB_COOKIES_JSON", "")
-
-FB_USER_AGENT = os.getenv(
-    "FB_USER_AGENT",
-    "Mozilla/5.0 (Linux; Android 10; SM-G973F) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Mobile Safari/537.36",
+# откуда берём список FB-групп
+FB_GROUPS_API_URL = os.getenv(
+    "FB_GROUPS_API_URL",
+    f"{API_BASE_URL}/api/fb_groups",
 )
 
-FB_BASIC_HOST = os.getenv("FB_BASIC_HOST", "mbasic.facebook.com")
+APIFY_TOKEN = os.getenv("APIFY_TOKEN")
+APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "AtBpiepuIUNs2k2ku")
+
+if not APIFY_TOKEN:
+    raise RuntimeError("APIFY_TOKEN is not set")
+
+# JSON-массив cookies как в твоём примере выше
+FB_COOKIES_JSON = os.getenv("FB_COOKIES_JSON", "[]")
+try:
+    FB_COOKIES = json.loads(FB_COOKIES_JSON)
+except Exception as e:
+    logger.error("❌ Не удалось распарсить FB_COOKIES_JSON: %s", e)
+    FB_COOKIES = []
+
+APIFY_MIN_DELAY = int(os.getenv("APIFY_MIN_DELAY", "1"))
+APIFY_MAX_DELAY = int(os.getenv("APIFY_MAX_DELAY", "10"))
+
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "900"))  # 15 мин по умолчанию
+
+KEYWORDS = [
+    "вакансия",
+    "работа",
+    "job",
+    "hiring",
+    "remote",
+    "developer",
+    "программист",
+]
+
+_seen_hashes: set[str] = set()
 
 
-# ----------------- КУКИ -----------------
+# ---------- УТИЛИТЫ ----------
 
-
-def load_cookies() -> Optional[Dict[str, str]]:
-    if not FB_COOKIES_JSON:
-        log.warning("⚠️ FB_COOKIES_JSON не задан — Facebook, скорее всего, покажет логин/капчу")
-        return None
-
-    try:
-        raw = json.loads(FB_COOKIES_JSON)
-    except json.JSONDecodeError as e:
-        log.error(f"❌ Не могу распарсить FB_COOKIES_JSON как JSON: {e}")
-        return None
-
-    cookies: Dict[str, str]
-    if isinstance(raw, dict):
-        cookies = {k: str(v) for k, v in raw.items()}
-    elif isinstance(raw, list):
-        cookies = {
-            c["name"]: str(c["value"])
-            for c in raw
-            if isinstance(c, dict) and "name" in c and "value" in c
-        }
-    else:
-        log.error("❌ Неподдерживаемый формат FB_COOKIES_JSON (ожидался dict или list)")
-        return None
-
-    if not cookies:
-        log.warning("⚠️ В FB_COOKIES_JSON нет ни одной cookies-пары")
-        return None
-
-    log.info(f"Cookies загружены. Ключи: {list(cookies.keys())}")
-    return cookies
-
-
-def create_fb_session(cookies: Optional[Dict[str, str]]) -> requests.Session:
-    s = requests.Session()
-    s.headers.update(
-        {
-            "User-Agent": FB_USER_AGENT,
-            "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }
-    )
-    if cookies:
-        s.cookies.update(cookies)
-    return s
-
-
-# ----------------- ГРУППЫ ИЗ МИНИАППА -----------------
-
-
-def get_fb_groups() -> List[Dict]:
-    if not API_BASE_URL:
-        log.error("❌ API_BASE_URL не задан — не могу получить список групп.")
-        return []
-
-    url = f"{API_BASE_URL}/api/groups"
-    log.info(f"API групп: {url}")
-
-    try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-    except RequestException as e:
-        log.error(f"❌ Не удалось получить группы: {e}")
-        return []
-
-    try:
-        data = resp.json()
-    except ValueError:
-        log.error("❌ Невалидный JSON при получении групп")
-        return []
-
-    all_groups = data.get("groups") or []
-    enabled_groups = [g for g in all_groups if g.get("enabled")]
-
-    fb_groups: List[Dict] = []
-    skipped_non_fb: List[str] = []
-
-    for g in enabled_groups:
-        gid = (g.get("group_id") or "").strip()
-        low = gid.lower()
-
-        if "t.me/" in low or "telegram.me" in low:
-            skipped_non_fb.append(gid)
-            continue
-
-        if "facebook.com" in low or "fb.com" in low:
-            fb_groups.append(g)
-        else:
-            skipped_non_fb.append(gid)
-
-    log.info(
-        f"Всего групп из API: {len(all_groups)}; активных: {len(enabled_groups)}; facebook-групп: {len(fb_groups)}"
-    )
-    if skipped_non_fb:
-        log.info(f"Пропущены не-facebook источники: {skipped_non_fb}")
-
-    return fb_groups
-
-
-# ----------------- УТИЛИТЫ -----------------
-
-
-def normalize_group_link_to_basic(group_link: str) -> str:
-    group_link = (group_link or "").strip()
-    if not group_link:
-        return f"https://{FB_BASIC_HOST}/groups"
-
-    if not group_link.startswith("http://") and not group_link.startswith("https://"):
-        return f"https://{FB_BASIC_HOST}/groups/{group_link}"
-
-    parsed = urlparse(group_link)
-    path = parsed.path or "/"
-    return f"https://{FB_BASIC_HOST}{path}"
-
-
-def matches_keywords(text: str) -> bool:
+def matches_keywords(text: str | None) -> bool:
     if not text:
         return False
     low = text.lower()
     return any(k in low for k in KEYWORDS)
 
 
-# ----------------- ПАРСИНГ mbasic.facebook.com -----------------
+def today_str() -> str:
+    return date.today().isoformat()  # 'YYYY-MM-DD'
 
 
-def fetch_group_html(session: requests.Session, basic_url: str) -> Optional[str]:
+def get_fb_groups() -> List[str]:
+    """
+    Ожидаемый ответ миниаппа:
+    { "groups": [ { "id": 1, "group_url": "...", "enabled": true }, ... ] }
+    """
     try:
-        log.info(f"🔎 Загружаю basic-группу: {basic_url}")
-        resp = session.get(basic_url, timeout=30, allow_redirects=False)
-    except RequestException as e:
-        log.error(f"❌ Ошибка сети при запросе {basic_url}: {e}")
-        return None
-
-    if 300 <= resp.status_code < 400:
-        loc = resp.headers.get("Location", "")
-        log.warning(
-            f"⚠️ Редирект {resp.status_code} с {resp.url} на {loc} — "
-            f"Facebook не хочет отдавать basic-страницу"
-        )
-        return None
-
-    try:
+        logger.info("Запрашиваю FB-группы из %s", FB_GROUPS_API_URL)
+        resp = requests.get(FB_GROUPS_API_URL, timeout=30)
         resp.raise_for_status()
-    except HTTPError as e:
-        log.error(f"❌ HTTP ошибка при запросе {basic_url}: {e} (url={resp.url})")
-        # попробуем залогировать кусок ответа для дебага
-        snippet = resp.text[:500].replace("\n", " ")
-        log.warning(f"🔍 Фрагмент HTML при ошибке: {snippet}")
-        return None
+        data = resp.json()
+    except Exception as e:
+        logger.error("❌ Не удалось получить FB-группы: %s", e)
+        return []
 
-    # debug: первый кусок HTML, чтобы понять, что за страница приходит
-    snippet = resp.text[:500].replace("\n", " ")
-    log.info(f"🔍 Первый фрагмент HTML ({len(resp.text)} символов): {snippet}")
-
-    return resp.text
-
-
-def extract_posts_from_basic_html(
-    html: str, base_url: str
-) -> List[Tuple[str, Optional[str], Optional[datetime]]]:
-    soup = BeautifulSoup(html, "lxml")
-    posts: List[Tuple[str, Optional[str], Optional[datetime]]] = []
-
-    # 1. Пытаемся найти основной контейнер для постов группы
-    stories_container = soup.find(id="m_group_stories_container")
-    if stories_container:
-        candidates = stories_container.find_all("div", recursive=False)
-    else:
-        candidates = []
-
-    # 2. Если не нашли — fallback: различные варианты контейнеров
-    if not candidates:
-        candidates = soup.find_all("article")
-
-    if not candidates:
-        candidates = soup.find_all("div", attrs={"data-ft": True, "role": "article"})
-
-    if not candidates:
-        candidates = soup.find_all("div", attrs={"data-ft": True})
-
-    if not candidates:
-        candidates = [
-            d
-            for d in soup.find_all("div")
-            if (d.get("id") or "").startswith("m_story")
-        ]
-
-    if not candidates:
-        log.warning("⚠️ Не удалось найти контейнеры постов в basic HTML")
-        return posts
-
-    for block in candidates[:POSTS_PER_GROUP]:
-        # иногда внутри ещё один div с собственно текстом
-        content_block = block
-        inner = block.find("div")
-        if inner and inner.get_text(strip=True):
-            content_block = inner
-
-        text = content_block.get_text(" ", strip=True)
-        if not text:
+    groups = data.get("groups") or []
+    urls: List[str] = []
+    for g in groups:
+        if not g.get("enabled", True):
             continue
+        url = (g.get("group_url") or "").strip()
+        if url:
+            urls.append(url)
 
-        post_url: Optional[str] = None
-        for a in block.find_all("a", href=True):
-            href = a["href"]
-            if (
-                "story.php" in href
-                or "/permalink/" in href
-                or "/posts/" in href
-                or "/groups/" in href and "view=permalink" in href
-            ):
-                post_url = urljoin(base_url, href.split("&", 1)[0])
-                break
-
-        created_at: Optional[datetime] = None
-        abbr = block.find("abbr")
-        if abbr and abbr.has_attr("data-utime"):
-            try:
-                ts = int(abbr["data-utime"])
-                created_at = datetime.utcfromtimestamp(ts)
-            except Exception:
-                created_at = None
-        else:
-            span = block.find("span", attrs={"data-utime": True})
-            if span:
-                try:
-                    ts = int(span["data-utime"])
-                    created_at = datetime.utcfromtimestamp(ts)
-                except Exception:
-                    created_at = None
-
-        posts.append((text, post_url, created_at))
-
-    log.info(f"📄 Найдено {len(posts)} потенциальных постов в basic HTML")
-    return posts
+    logger.info("📥 Активные FB-группы: %s", urls)
+    return urls
 
 
-# ----------------- ОТПРАВКА ВАКАНСИЙ -----------------
+def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
+    """
+    Вызывает actor AtBpiepuIUNs2k2ku для одной группы
+    с тем же input, что у тебя в консоли:
+      - cookie: [ ... ]
+      - maxDelay, minDelay
+      - proxy.useApifyProxy = true
+      - scrapeGroupPosts.groupUrl
+      - scrapeUntil = сегодня
+      - sortType = new_posts
+    """
+    endpoint = (
+        f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
+        f"?token={APIFY_TOKEN}"
+    )
+
+    actor_input = {
+        "cookie": FB_COOKIES,
+        "maxDelay": APIFY_MAX_DELAY,
+        "minDelay": APIFY_MIN_DELAY,
+        "proxy": {
+            "useApifyProxy": True,
+        },
+        "scrapeGroupPosts.groupUrl": group_url,
+        "scrapeUntil": today_str(),  # посты до сегодняшнего дня
+        "sortType": "new_posts",
+    }
+
+    logger.info("▶️ Вызываю Apify actor для группы: %s", group_url)
+
+    try:
+        resp = requests.post(endpoint, json=actor_input, timeout=600)
+        resp.raise_for_status()
+    except Exception as e:
+        logger.error("❌ Ошибка вызова Apify для %s: %s", group_url, e)
+        return []
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        logger.error("❌ JSON-ошибка от Apify (%s): %s", group_url, e)
+        return []
+
+    # run-sync-get-dataset-items обычно возвращает либо список, либо объект с items
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict) and "items" in data:
+        items = data["items"]
+    else:
+        logger.warning(
+            "Неожиданный формат ответа Apify для %s (%s): %r",
+            group_url,
+            type(data).__name__,
+            str(data)[:300],
+        )
+        items = []
+
+    logger.info("📄 Apify для %s вернул %d постов", group_url, len(items))
+    return items
 
 
-def send_job_to_api(
-    source_name: str,
-    external_id: str,
-    url: Optional[str],
+def hash_post(text: str, url: str | None) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    h.update((text or "").encode("utf-8"))
+    if url:
+        h.update(url.encode("utf-8"))
+    return h.hexdigest()
+
+
+def send_job_to_miniapp(
     text: str,
-    created_at: Optional[datetime],
-) -> None:
-    if not API_BASE_URL:
-        log.error("❌ API_BASE_URL не задан — не могу отправить вакансию")
+    post_url: str | None,
+    created_at: str | None,
+    group_url: str | None,
+):
+    if not text:
         return
 
-    endpoint = f"{API_BASE_URL}/post"
-    headers = {"Content-Type": "application/json"}
-    if API_SECRET:
-        headers["X-API-KEY"] = API_SECRET
+    url = f"{API_BASE_URL}/post"
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-KEY": API_SECRET,
+    }
 
     payload = {
         "source": "facebook",
-        "source_name": source_name,
-        "external_id": str(external_id),
-        "url": url,
+        "source_name": group_url or "facebook_group",
+        "external_id": post_url or (created_at or ""),
+        "url": post_url,
         "text": text,
-        "created_at": created_at.isoformat() if created_at else None,
+        "created_at": created_at,
     }
 
     try:
-        resp = requests.post(endpoint, headers=headers, json=payload, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        status = data.get("status")
-        if status == "duplicate":
-            log.info(f"🔁 Дубликат вакансии {external_id} ({source_name})")
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
+        if resp.status_code >= 300:
+            logger.error(
+                "❌ Ошибка отправки в миниапп: %s %s",
+                resp.status_code,
+                resp.text[:500],
+            )
         else:
-            log.info(f"✅ Вакансия отправлена в API ({source_name} / {external_id})")
-    except RequestException as e:
-        log.error(f"❌ Ошибка отправки вакансии в API: {e}")
+            logger.info("✅ Вакансия отправлена в миниапп: %s", (post_url or "")[:120])
+    except Exception as e:
+        logger.error("❌ Сетевая ошибка при отправке в миниапп: %s", e)
 
 
-# ----------------- ПАРСИНГ ОДНОЙ ГРУППЫ -----------------
+# ---------- ОСНОВНОЙ ЦИКЛ ----------
 
-
-def parse_one_group(
-    session: requests.Session,
-    group_link: str,
-    group_name: str,
-) -> int:
-    basic_url = normalize_group_link_to_basic(group_link)
-    log.info(f"🔍 Парсим группу: {group_name} ({group_link}) → {basic_url}")
-
-    html = fetch_group_html(session, basic_url)
-    if not html:
-        return 0
-
-    posts = extract_posts_from_basic_html(html, base_url=f"https://{FB_BASIC_HOST}")
-    sent = 0
-
-    for text, post_url, created_at in posts:
-        if not matches_keywords(text):
-            continue
-
-        base = group_link.split("?", 1)[0]
-        ext = f"{base}|{post_url or text[:50]}"
-        external_id = str(abs(hash(ext)))
-
-        send_job_to_api(
-            source_name=group_name or group_link,
-            external_id=external_id,
-            url=post_url,
-            text=text,
-            created_at=created_at,
-        )
-        sent += 1
-
-    log.info(f"📦 Отправлено {sent} вакансий для группы {group_name}")
-    return sent
-
-
-# ----------------- ГЛАВНЫЙ ЦИКЛ -----------------
-
-
-def run_once():
-    if not API_BASE_URL:
-        log.error("❌ API_BASE_URL не задан — останавливаю цикл")
+def process_cycle():
+    group_urls = get_fb_groups()
+    if not group_urls:
+        logger.warning("Нет FB-групп для парсинга, пропускаю цикл")
         return
 
-    log.info(f"API: {API_BASE_URL}")
-    log.info(f"Ключевые слова: {KEYWORDS}")
-
-    cookies = load_cookies()
-    session = create_fb_session(cookies)
-
-    groups = get_fb_groups()
     total_sent = 0
 
-    for g in groups:
-        group_link = g.get("group_id") or ""
-        group_name = g.get("group_name") or group_link
-        try:
-            total_sent += parse_one_group(session, group_link, group_name)
-            time.sleep(2)
-        except Exception as e:
-            log.error(f"❌ Неожиданная ошибка при парсинге {group_link}: {e}")
+    for group_url in group_urls:
+        items = call_apify_for_group(group_url)
 
-    log.info(f"✅ Цикл завершён. Всего отправлено вакансий: {total_sent}")
+        for item in items:
+            # имена полей у актора могут быть своими — подстраховываемся
+            text = (
+                item.get("text")
+                or item.get("message")
+                or item.get("content")
+                or item.get("postText")
+                or ""
+            )
+            if not matches_keywords(text):
+                continue
+
+            post_url = (
+                item.get("postUrl")
+                or item.get("url")
+                or item.get("post_url")
+            )
+
+            created_at = (
+                item.get("createdAt")
+                or item.get("timestamp")
+                or item.get("created_time")
+            )
+
+            group_field = (
+                item.get("groupUrl")
+                or item.get("group_url")
+                or group_url
+            )
+
+            h = hash_post(text, post_url)
+            if h in _seen_hashes:
+                logger.info("🔁 Дубликат поста (hash=%s), пропускаю", h)
+                continue
+            _seen_hashes.add(h)
+
+            send_job_to_miniapp(text, post_url, created_at, group_field)
+            total_sent += 1
+
+    logger.info("✅ Цикл завершён, всего отправлено вакансий: %d", total_sent)
 
 
 def main():
-    log.info("🚀 Запуск Facebook Job Parser (mbasic.facebook.com, расширенный парсер)")
+    logger.info("🚀 Запуск Facebook Job Parser через Apify actor %s", APIFY_ACTOR_ID)
     while True:
         try:
-            run_once()
+            process_cycle()
         except Exception as e:
-            log.error(f"❌ Ошибка в основном цикле: {e}")
-        log.info(f"⏳ Ожидание {CHECK_INTERVAL_MINUTES} минут...")
-        time.sleep(CHECK_INTERVAL_MINUTES * 60)
+            logger.error("❌ Необработанная ошибка в цикле: %s", e)
+        logger.info("⏳ Ожидание %d секунд до следующего цикла", POLL_INTERVAL_SECONDS)
+        time.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
