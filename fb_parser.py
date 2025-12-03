@@ -2,7 +2,7 @@ import os
 import time
 import json
 import logging
-from datetime import date
+from datetime import date, datetime
 from typing import List, Dict, Any
 
 import requests
@@ -44,7 +44,7 @@ except Exception as e:
 APIFY_MIN_DELAY = int(os.getenv("APIFY_MIN_DELAY", "1"))
 APIFY_MAX_DELAY = int(os.getenv("APIFY_MAX_DELAY", "10"))
 
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "900"))  # 15 мин по умолчанию
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "600"))
 
 KEYWORDS = [
     "вакансия",
@@ -72,32 +72,120 @@ def today_str() -> str:
     return date.today().isoformat()  # 'YYYY-MM-DD'
 
 
+def is_today(created_at) -> bool:
+    """Проверяем, что дата поста относится к сегодняшнему дню.
+
+    Пытаемся распарсить:
+    - ISO-строки (с или без 'Z')
+    - timestamp в секундах или миллисекундах
+    Если не получается — возвращаем False.
+    """
+    if not created_at:
+        return False
+
+    s = str(created_at)
+
+    # ISO формат
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.date() == date.today()
+    except Exception:
+        pass
+
+    # timestamp (секунды или миллисекунды)
+    try:
+        ts = float(s)
+        if ts > 1e12:  # очень большой — считаем, что миллисекунды
+            ts /= 1000.0
+        dt = datetime.utcfromtimestamp(ts)
+        return dt.date() == date.today()
+    except Exception:
+        return False
+
+
 def get_fb_groups() -> List[str]:
     """
+    Для FB-парсера:
     Ожидаемый ответ миниаппа:
-    { "groups": [ { "id": 1, "group_url": "...", "enabled": true }, ... ] }
+    {
+      "groups": [
+        { "id": 1, "group_url": "...", "enabled": true },
+        ...
+      ]
+    }
     """
     try:
         logger.info("Запрашиваю FB-группы из %s", FB_GROUPS_API_URL)
         resp = requests.get(FB_GROUPS_API_URL, timeout=30)
         resp.raise_for_status()
-        data = resp.json()
     except Exception as e:
-        logger.error("❌ Не удалось получить FB-группы: %s", e)
+        logger.error("❌ Ошибка запроса FB-групп: %s", e)
         return []
 
-    groups = data.get("groups") or []
+    try:
+        data = resp.json()
+    except Exception as e:
+        logger.error("❌ Ошибка JSON при разборе FB-групп: %s", e)
+        return []
+
+    groups_raw = data.get("groups") or []
     urls: List[str] = []
-    for g in groups:
+
+    for g in groups_raw:
         if not g.get("enabled", True):
             continue
-        url = (g.get("group_url") or "").strip()
-        if url:
-            urls.append(url)
+        url = (g.get("group_url") or g.get("group_id") or "").strip()
+        if not url:
+            continue
+        urls.append(url)
 
-    logger.info("📥 Активные FB-группы: %s", urls)
+    logger.info("Найдено %d включённых FB-групп", len(urls))
     return urls
 
+
+def hash_post(text: str, url: str | None) -> str:
+    base = (text or "").strip()
+    if url:
+        base += f"::{url}"
+    return str(abs(hash(base)))
+
+
+# ---------- ВЗАИМОДЕЙСТВИЕ С MINIAPP ----------
+
+def send_job_to_miniapp(
+    text: str,
+    post_url: str | None,
+    created_at: str | None,
+    group_url: str | None,
+) -> None:
+    """
+    Шлём вакансию в миниапп на /post
+    """
+    endpoint = f"{API_BASE_URL}/post"
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-KEY": API_SECRET,
+    }
+
+    payload: Dict[str, Any] = {
+        "source": "facebook",
+        "source_name": group_url or "facebook_group",
+        "external_id": post_url or (created_at or ""),
+        "url": post_url,
+        "text": text,
+        "sender_username": None,
+        "created_at": created_at,
+    }
+
+    try:
+        resp = requests.post(endpoint, json=payload, headers=headers, timeout=30)
+        resp.raise_for_status()
+        logger.info("✅ Успешно отправили вакансию в миниапп: %s", post_url)
+    except Exception as e:
+        logger.error("❌ Ошибка отправки вакансии в миниапп: %s", e)
+
+
+# ---------- ВЫЗОВ APIFY АКТОРА ----------
 
 def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
     """
@@ -127,8 +215,7 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
         "sortType": "new_posts",
     }
 
-    logger.info("▶️ Вызываю Apify actor для группы: %s", group_url)
-
+    logger.info("▶️ Вызов Apify для группы %s", group_url)
     try:
         resp = requests.post(endpoint, json=actor_input, timeout=600)
         resp.raise_for_status()
@@ -142,70 +229,19 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
         logger.error("❌ JSON-ошибка от Apify (%s): %s", group_url, e)
         return []
 
-    # run-sync-get-dataset-items обычно возвращает либо список, либо объект с items
+    # run-sync-get-dataset-items может вернуть список или объект с items
     if isinstance(data, list):
         items = data
     elif isinstance(data, dict) and "items" in data:
         items = data["items"]
     else:
         logger.warning(
-            "Неожиданный формат ответа Apify для %s (%s): %r",
-            group_url,
-            type(data).__name__,
-            str(data)[:300],
+            "Неожиданный формат ответа Apify для %s: %r", group_url, data
         )
-        items = []
+        return []
 
-    logger.info("📄 Apify для %s вернул %d постов", group_url, len(items))
+    logger.info("Получено %d элементов от Apify для %s", len(items), group_url)
     return items
-
-
-def hash_post(text: str, url: str | None) -> str:
-    import hashlib
-
-    h = hashlib.sha256()
-    h.update((text or "").encode("utf-8"))
-    if url:
-        h.update(url.encode("utf-8"))
-    return h.hexdigest()
-
-
-def send_job_to_miniapp(
-    text: str,
-    post_url: str | None,
-    created_at: str | None,
-    group_url: str | None,
-):
-    if not text:
-        return
-
-    url = f"{API_BASE_URL}/post"
-    headers = {
-        "Content-Type": "application/json",
-        "X-API-KEY": API_SECRET,
-    }
-
-    payload = {
-        "source": "facebook",
-        "source_name": group_url or "facebook_group",
-        "external_id": post_url or (created_at or ""),
-        "url": post_url,
-        "text": text,
-        "created_at": created_at,
-    }
-
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=30)
-        if resp.status_code >= 300:
-            logger.error(
-                "❌ Ошибка отправки в миниапп: %s %s",
-                resp.status_code,
-                resp.text[:500],
-            )
-        else:
-            logger.info("✅ Вакансия отправлена в миниапп: %s", (post_url or "")[:120])
-    except Exception as e:
-        logger.error("❌ Сетевая ошибка при отправке в миниапп: %s", e)
 
 
 # ---------- ОСНОВНОЙ ЦИКЛ ----------
@@ -245,6 +281,10 @@ def process_cycle():
                 or item.get("created_time")
             )
 
+            # берём только сегодняшние посты
+            if not is_today(created_at):
+                continue
+
             group_field = (
                 item.get("groupUrl")
                 or item.get("group_url")
@@ -257,7 +297,7 @@ def process_cycle():
                 continue
             _seen_hashes.add(h)
 
-            send_job_to_miniapp(text, post_url, created_at, group_field)
+            send_job_to_miniapp(text, post_url, str(created_at) if created_at else None, group_field)
             total_sent += 1
 
     logger.info("✅ Цикл завершён, всего отправлено вакансий: %d", total_sent)
