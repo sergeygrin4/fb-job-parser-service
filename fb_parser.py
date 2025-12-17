@@ -179,13 +179,7 @@ def send_job_to_miniapp(
 
 def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
     """
-    Вызывает actor (curious_coder/facebook-post-scraper) с input:
-      - cookie
-      - maxDelay, minDelay
-      - proxy.useApifyProxy = true
-      - scrapeGroupPosts.groupUrl
-      - scrapeUntil = сегодня
-      - sortType = new_posts
+    Вызывает actor (curious_coder/facebook-post-scraper)
     """
     endpoint = (
         f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
@@ -200,31 +194,43 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
             "useApifyProxy": True,
         },
         "scrapeGroupPosts.groupUrl": group_url,
-        "scrapeUntil": today_str(),  # до сегодняшнего дня
+        "scrapeUntil": today_str(),
         "sortType": "new_posts",
     }
 
     logger.info("▶️ Вызов Apify для группы %s", group_url)
+
     try:
         resp = requests.post(endpoint, json=actor_input, timeout=600)
         resp.raise_for_status()
+
     except Exception as e:
         logger.error(
-    "❌ Ошибка вызова Apify для %s: %s",
-    group_url,
-    e
-)
+            "❌ Ошибка вызова Apify для %s: %s",
+            group_url,
+            e
+        )
 
-if "401" in str(e) or "unauthorized" in str(e).lower():
-    send_alert(
-        "Facebook парсер не смог обратиться к Apify.\n"
-        "Возможные причины:\n"
-        "- истёк APIFY_TOKEN\n"
-        "- протухли Facebook cookies\n\n"
-        f"Группа: {group_url}"
-    )
+        error_text = str(e).lower()
+
+        if "401" in error_text or "unauthorized" in error_text:
+            send_alert(
+                "Facebook парсер не смог обратиться к Apify.\n"
+                "Возможные причины:\n"
+                "- истёк APIFY_TOKEN\n"
+                "- протухли Facebook cookies\n\n"
+                f"Группа: {group_url}"
+            )
+        else:
+            send_alert(
+                "Ошибка Facebook парсера при обращении к Apify.\n\n"
+                f"Группа: {group_url}\n"
+                f"Ошибка: {e}"
+            )
 
         return []
+
+    # ---- дальше всё как было ----
 
     try:
         data = resp.json()
@@ -232,19 +238,21 @@ if "401" in str(e) or "unauthorized" in str(e).lower():
         logger.error("❌ JSON-ошибка от Apify (%s): %s", group_url, e)
         return []
 
-    # run-sync-get-dataset-items может вернуть список или объект с items
     if isinstance(data, list):
         items = data
     elif isinstance(data, dict) and "items" in data:
         items = data["items"]
     else:
         logger.warning(
-            "Неожиданный формат ответа Apify для %s: %r", group_url, data
+            "Неожиданный формат ответа Apify для %s: %r",
+            group_url,
+            data
         )
         return []
 
     logger.info("Получено %d элементов от Apify для %s", len(items), group_url)
     return items
+
 
 
 # ---------- ОСНОВНОЙ ЦИКЛ ----------
