@@ -209,7 +209,21 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
         resp = requests.post(endpoint, json=actor_input, timeout=600)
         resp.raise_for_status()
     except Exception as e:
-        logger.error("❌ Ошибка вызова Apify для %s: %s", group_url, e)
+        logger.error(
+    "❌ Ошибка вызова Apify для %s: %s",
+    group_url,
+    e
+)
+
+if "401" in str(e) or "unauthorized" in str(e).lower():
+    send_alert(
+        "Facebook парсер не смог обратиться к Apify.\n"
+        "Возможные причины:\n"
+        "- истёк APIFY_TOKEN\n"
+        "- протухли Facebook cookies\n\n"
+        f"Группа: {group_url}"
+    )
+
         return []
 
     try:
