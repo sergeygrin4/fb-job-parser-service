@@ -21,7 +21,6 @@ if not API_BASE_URL:
 
 API_SECRET = os.getenv("API_SECRET", "")
 
-# откуда берём список FB-групп
 FB_GROUPS_API_URL = os.getenv(
     "FB_GROUPS_API_URL",
     f"{API_BASE_URL}/api/fb_groups",
@@ -33,7 +32,6 @@ APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "AtBpiepuIUNs2k2ku")
 if not APIFY_TOKEN:
     raise RuntimeError("APIFY_TOKEN is not set")
 
-# JSON-массив cookies как в твоём примере выше
 FB_COOKIES_JSON = os.getenv("FB_COOKIES_JSON", "[]")
 try:
     FB_COOKIES = json.loads(FB_COOKIES_JSON)
@@ -43,43 +41,35 @@ except Exception as e:
 
 APIFY_MIN_DELAY = int(os.getenv("APIFY_MIN_DELAY", "1"))
 APIFY_MAX_DELAY = int(os.getenv("APIFY_MAX_DELAY", "10"))
-
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "600"))
 
 _seen_hashes: set[str] = set()
+
+# ⛔ флаг автостопа
+FB_PARSER_DISABLED = False
 
 
 # ---------- УТИЛИТЫ ----------
 
 def today_str() -> str:
-    return date.today().isoformat()  # 'YYYY-MM-DD'
+    return date.today().isoformat()
 
 
 def is_today(created_at) -> bool:
-    """
-    Проверяем, что дата поста относится к сегодняшнему дню.
-
-    Пытаемся распарсить:
-    - ISO-строки (с или без 'Z')
-    - timestamp в секундах или миллисекундах.
-    Если не получается — считаем, что пост НЕ сегодняшний.
-    """
     if not created_at:
         return False
 
     s = str(created_at)
 
-    # ISO формат
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         return dt.date() == date.today()
     except Exception:
         pass
 
-    # timestamp (секунды или миллисекунды)
     try:
         ts = float(s)
-        if ts > 1e12:  # очень крупное число — скорее всего миллисекунды
+        if ts > 1e12:
             ts /= 1000.0
         dt = datetime.utcfromtimestamp(ts)
         return dt.date() == date.today()
@@ -88,66 +78,40 @@ def is_today(created_at) -> bool:
 
 
 def get_fb_groups() -> List[str]:
-    """
-    Ожидаемый ответ миниаппа:
-    {
-      "groups": [
-        { "id": 1, "group_url": "...", "enabled": true },
-        ...
-      ]
-    }
-    """
     try:
         logger.info("Запрашиваю FB-группы из %s", FB_GROUPS_API_URL)
         resp = requests.get(FB_GROUPS_API_URL, timeout=30)
         resp.raise_for_status()
+        data = resp.json()
     except Exception as e:
         logger.error("❌ Ошибка запроса FB-групп: %s", e)
         return []
 
-    try:
-        data = resp.json()
-    except Exception as e:
-        logger.error("❌ Ошибка JSON при разборе FB-групп: %s", e)
-        return []
-
-    groups_raw = data.get("groups") or []
-    urls: List[str] = []
-
-    for g in groups_raw:
+    urls = []
+    for g in data.get("groups", []):
         if not g.get("enabled", True):
             continue
-        url = (g.get("group_url") or g.get("group_id") or "").strip()
-        if not url:
-            continue
-        urls.append(url)
+        url = (g.get("group_url") or "").strip()
+        if url:
+            urls.append(url)
 
     logger.info("Найдено %d включённых FB-групп", len(urls))
     return urls
 
-# ---- Проверка ошибок авторизации Facebook внутри Apify ----
-if isinstance(data, dict):
-    error_text = (
-        data.get("error")
-        or data.get("message")
-        or data.get("statusMessage")
-        or ""
-    )
 
-    if isinstance(error_text, str) and "failed to authorize with given cookies" in error_text.lower():
-        logger.error(
-            "❌ Apify сообщил о невалидных Facebook cookies для %s",
-            group_url,
+def send_alert(text: str):
+    try:
+        requests.post(
+            f"{API_BASE_URL}/api/alert",
+            headers={"X-API-SECRET": API_SECRET},
+            json={
+                "source": "fb_parser",
+                "message": text,
+            },
+            timeout=10,
         )
-
-        send_alert(
-            "❌ Facebook cookies протухли.\n"
-            "Apify не смог авторизоваться в Facebook.\n\n"
-            "Нужно обновить cookies аккаунта.\n\n"
-            f"Группа: {group_url}"
-        )
-
-        return []
+    except Exception:
+        pass
 
 
 def hash_post(text: str, url: str | None) -> str:
@@ -157,54 +121,45 @@ def hash_post(text: str, url: str | None) -> str:
     return str(abs(hash(base)))
 
 
-# ---------- ВЗАИМОДЕЙСТВИЕ С MINIAPP ----------
-
 def send_job_to_miniapp(
     text: str,
     post_url: str | None,
     created_at: str | None,
     group_url: str | None,
     author_url: str | None,
-) -> None:
-    """
-    Шлём пост в миниапп на /post.
-
-    Используем:
-    - text        -> текст вакансии/поста
-    - url         -> кнопка "Перейти к посту"
-    - author_url  -> кладём в sender_username, чтобы миниапп мог сделать кнопку "Написать автору"
-    """
+):
     endpoint = f"{API_BASE_URL}/post"
     headers = {
         "Content-Type": "application/json",
         "X-API-KEY": API_SECRET,
     }
 
-    payload: Dict[str, Any] = {
+    payload = {
         "source": "facebook",
         "source_name": group_url or "facebook_group",
-        "external_id": post_url or (created_at or ""),
+        "external_id": post_url or created_at,
         "url": post_url,
         "text": text,
-        # сюда передаём ссылку на профиль автора
         "sender_username": author_url,
         "created_at": created_at,
     }
 
     try:
-        resp = requests.post(endpoint, json=payload, headers=headers, timeout=30)
-        resp.raise_for_status()
-        logger.info("✅ Успешно отправили пост в миниапп: %s", post_url)
+        requests.post(endpoint, json=payload, headers=headers, timeout=30).raise_for_status()
+        logger.info("✅ Отправили пост в миниапп: %s", post_url)
     except Exception as e:
         logger.error("❌ Ошибка отправки поста в миниапп: %s", e)
 
 
-# ---------- ВЫЗОВ APIFY АКТОРА ----------
+# ---------- APIFY ----------
 
 def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
-    """
-    Вызывает actor (curious_coder/facebook-post-scraper)
-    """
+    global FB_PARSER_DISABLED
+
+    if FB_PARSER_DISABLED:
+        logger.warning("⛔ FB парсер отключён из-за невалидных cookies")
+        return []
+
     endpoint = (
         f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
         f"?token={APIFY_TOKEN}"
@@ -214,9 +169,7 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
         "cookie": FB_COOKIES,
         "maxDelay": APIFY_MAX_DELAY,
         "minDelay": APIFY_MIN_DELAY,
-        "proxy": {
-            "useApifyProxy": True,
-        },
+        "proxy": {"useApifyProxy": True},
         "scrapeGroupPosts.groupUrl": group_url,
         "scrapeUntil": today_str(),
         "sortType": "new_posts",
@@ -227,56 +180,40 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
     try:
         resp = requests.post(endpoint, json=actor_input, timeout=600)
         resp.raise_for_status()
-
-    except Exception as e:
-        logger.error(
-            "❌ Ошибка вызова Apify для %s: %s",
-            group_url,
-            e
-        )
-
-        error_text = str(e).lower()
-
-        if "401" in error_text or "unauthorized" in error_text:
-            send_alert(
-                "Facebook парсер не смог обратиться к Apify.\n"
-                "Возможные причины:\n"
-                "- истёк APIFY_TOKEN\n"
-                "- протухли Facebook cookies\n\n"
-                f"Группа: {group_url}"
-            )
-        else:
-            send_alert(
-                "Ошибка Facebook парсера при обращении к Apify.\n\n"
-                f"Группа: {group_url}\n"
-                f"Ошибка: {e}"
-            )
-
-        return []
-
-    # ---- дальше всё как было ----
-
-    try:
         data = resp.json()
     except Exception as e:
-        logger.error("❌ JSON-ошибка от Apify (%s): %s", group_url, e)
+        logger.error("❌ Ошибка вызова Apify для %s: %s", group_url, e)
+        send_alert(f"Ошибка Apify при запросе группы:\n{group_url}\n\n{e}")
         return []
+
+    if isinstance(data, dict):
+        error_text = (
+            data.get("error")
+            or data.get("message")
+            or data.get("statusMessage")
+            or ""
+        )
+
+        if "failed to authorize with given cookies" in error_text.lower():
+            FB_PARSER_DISABLED = True
+
+            logger.error("❌ Facebook cookies протухли — парсер остановлен")
+
+            send_alert(
+                "❌ Facebook cookies протухли.\n"
+                "FB парсер автоматически остановлен.\n\n"
+                "Обнови cookies и сделай redeploy."
+            )
+            return []
 
     if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict) and "items" in data:
-        items = data["items"]
-    else:
-        logger.warning(
-            "Неожиданный формат ответа Apify для %s: %r",
-            group_url,
-            data
-        )
-        return []
+        return data
 
-    logger.info("Получено %d элементов от Apify для %s", len(items), group_url)
-    return items
+    if isinstance(data, dict) and "items" in data:
+        return data["items"]
 
+    logger.warning("Неожиданный формат ответа Apify: %r", data)
+    return []
 
 
 # ---------- ОСНОВНОЙ ЦИКЛ ----------
@@ -284,81 +221,43 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
 def process_cycle():
     group_urls = get_fb_groups()
     if not group_urls:
-        logger.warning("Нет FB-групп для парсинга, пропускаю цикл")
         return
-
-    total_sent = 0
 
     for group_url in group_urls:
         items = call_apify_for_group(group_url)
 
         for item in items:
-            # 1) текст поста
-            text = (
-                item.get("text")
-                or item.get("message")
-                or item.get("content")
-                or item.get("postText")
-                or ""
-            )
+            text = item.get("text") or ""
+            post_url = item.get("url")
+            created_at = item.get("createdAt")
 
-            # 2) ссылка на пост
-            post_url = (
-                item.get("url")
-                or item.get("postUrl")
-                or item.get("post_url")
-            )
-
-            # 3) дата/время создания
-            created_at_raw = (
-                item.get("createdAt")
-                or item.get("timestamp")
-                or item.get("created_time")
-            )
-
-            # берём только сегодняшние посты
-            if not is_today(created_at_raw):
+            if not is_today(created_at):
                 continue
 
-            # 4) ссылка на автора (user.url)
-            user_data = item.get("user") or {}
-            author_url = user_data.get("url")
+            user = item.get("user") or {}
+            author_url = user.get("url")
 
-            # 5) "группа" — для source_name
-            group_field = (
-                item.get("groupUrl")
-                or item.get("group_url")
-                or group_url
-            )
-
-            # 6) защита от дублей
             h = hash_post(text, post_url)
             if h in _seen_hashes:
-                logger.info("🔁 Дубликат поста (hash=%s), пропускаю", h)
                 continue
             _seen_hashes.add(h)
 
-            # 7) отправляем в миниапп
             send_job_to_miniapp(
                 text=text,
                 post_url=post_url,
-                created_at=str(created_at_raw) if created_at_raw is not None else None,
-                group_url=group_field,
+                created_at=str(created_at),
+                group_url=group_url,
                 author_url=author_url,
             )
-            total_sent += 1
-
-    logger.info("✅ Цикл завершён, всего отправлено постов в миниапп: %d", total_sent)
 
 
 def main():
-    logger.info("🚀 Запуск Facebook Job Parser через Apify actor %s", APIFY_ACTOR_ID)
+    logger.info("🚀 Запуск Facebook Job Parser через Apify")
     while True:
         try:
             process_cycle()
         except Exception as e:
-            logger.error("❌ Необработанная ошибка в цикле: %s", e)
-        logger.info("⏳ Ожидание %d секунд до следующего цикла", POLL_INTERVAL_SECONDS)
+            logger.error("❌ Критическая ошибка цикла: %s", e)
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
