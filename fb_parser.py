@@ -125,6 +125,30 @@ def get_fb_groups() -> List[str]:
     logger.info("Найдено %d включённых FB-групп", len(urls))
     return urls
 
+# ---- Проверка ошибок авторизации Facebook внутри Apify ----
+if isinstance(data, dict):
+    error_text = (
+        data.get("error")
+        or data.get("message")
+        or data.get("statusMessage")
+        or ""
+    )
+
+    if isinstance(error_text, str) and "failed to authorize with given cookies" in error_text.lower():
+        logger.error(
+            "❌ Apify сообщил о невалидных Facebook cookies для %s",
+            group_url,
+        )
+
+        send_alert(
+            "❌ Facebook cookies протухли.\n"
+            "Apify не смог авторизоваться в Facebook.\n\n"
+            "Нужно обновить cookies аккаунта.\n\n"
+            f"Группа: {group_url}"
+        )
+
+        return []
+
 
 def hash_post(text: str, url: str | None) -> str:
     base = (text or "").strip()
