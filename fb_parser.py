@@ -103,7 +103,7 @@ def send_alert(text: str):
     try:
         requests.post(
             f"{API_BASE_URL}/api/alert",
-            headers={"X-API-SECRET": API_SECRET},
+            headers={"X-API-KEY": API_SECRET} if API_SECRET else {},
             json={
                 "source": "fb_parser",
                 "message": text,
