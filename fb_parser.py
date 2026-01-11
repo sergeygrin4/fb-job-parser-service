@@ -47,7 +47,11 @@ def fetch_fb_cookies_from_miniapp() -> list:
     """Берём cookies из miniapp (parser_secrets), чтобы не делать redeploy."""
     try:
         url = f"{API_BASE_URL}/api/parser_secrets/fb_cookies_json"
-        r = requests.get(url, headers={"X-API-KEY": API_SECRET} if API_SECRET else {}, timeout=10)
+        r = requests.get(
+            url,
+            headers={"X-API-KEY": API_SECRET} if API_SECRET else {},
+            timeout=10,
+        )
         r.raise_for_status()
         data = r.json() or {}
         value = data.get("value")
@@ -84,12 +88,14 @@ def is_today(created_at) -> bool:
 
     s = str(created_at)
 
+    # сначала пробуем ISO-строку
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         return dt.date() == date.today()
     except Exception:
         pass
 
+    # потом — timestamp (сек/мс)
     try:
         ts = float(s)
         if ts > 1e12:
@@ -110,7 +116,7 @@ def get_fb_groups() -> List[str]:
         logger.error("❌ Ошибка запроса FB-групп: %s", e)
         return []
 
-    urls = []
+    urls: list[str] = []
     for g in data.get("groups", []):
         if not g.get("enabled", True):
             continue
@@ -168,10 +174,30 @@ def send_job_to_miniapp(
     }
 
     try:
-        requests.post(endpoint, json=payload, headers=headers, timeout=30).raise_for_status()
+        requests.post(
+            endpoint,
+            json=payload,
+            headers=headers,
+            timeout=30,
+        ).raise_for_status()
         logger.info("✅ Отправили пост в миниапп: %s", post_url)
     except Exception as e:
         logger.error("❌ Ошибка отправки поста в миниапп: %s", e)
+
+
+def post_status(key: str, value: str):
+    """Пинг статуса парсера в miniapp (/api/parser_status/<key>)."""
+    try:
+        url = f"{API_BASE_URL}/api/parser_status/{key}"
+        headers = {"X-API-KEY": API_SECRET} if API_SECRET else {}
+        requests.post(
+            url,
+            json={"value": value},
+            headers=headers,
+            timeout=10,
+        )
+    except Exception:
+        pass
 
 
 # ---------- APIFY ----------
@@ -255,8 +281,13 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
 # ---------- ОСНОВНОЙ ЦИКЛ ----------
 
 def process_cycle():
+    """Один цикл: пройтись по всем группам и отправить свежие посты в миниапп."""
     group_urls = get_fb_groups()
+    now_iso = datetime.utcnow().isoformat() + "Z"
+
     if not group_urls:
+        # Групп нет, но парсер жив — пингуем fb_last_ok, чтобы вотчдог не ругался.
+        post_status("fb_last_ok", now_iso)
         return
 
     for group_url in group_urls:
@@ -285,6 +316,9 @@ def process_cycle():
                 group_url=group_url,
                 author_url=author_url,
             )
+
+    # цикл успешно отработал — пингуем fb_last_ok
+    post_status("fb_last_ok", now_iso)
 
 
 def main():
