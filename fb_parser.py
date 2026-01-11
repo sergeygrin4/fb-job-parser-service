@@ -33,11 +33,34 @@ if not APIFY_TOKEN:
     raise RuntimeError("APIFY_TOKEN is not set")
 
 FB_COOKIES_JSON = os.getenv("FB_COOKIES_JSON", "[]")
-try:
-    FB_COOKIES = json.loads(FB_COOKIES_JSON)
-except Exception as e:
-    logger.error("❌ Не удалось распарсить FB_COOKIES_JSON: %s", e)
-    FB_COOKIES = []
+
+
+def _load_cookies_from_env() -> list:
+    try:
+        return json.loads(FB_COOKIES_JSON)
+    except Exception as e:
+        logger.error("❌ Не удалось распарсить FB_COOKIES_JSON: %s", e)
+        return []
+
+
+def fetch_fb_cookies_from_miniapp() -> list:
+    """Берём cookies из miniapp (parser_secrets), чтобы не делать redeploy."""
+    try:
+        url = f"{API_BASE_URL}/api/parser_secrets/fb_cookies_json"
+        r = requests.get(url, headers={"X-API-KEY": API_SECRET} if API_SECRET else {}, timeout=10)
+        r.raise_for_status()
+        data = r.json() or {}
+        value = data.get("value")
+        if not value:
+            return []
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except Exception:
+        return []
+
+
+# initial cookies (fallback)
+FB_COOKIES = fetch_fb_cookies_from_miniapp() or _load_cookies_from_env()
 
 APIFY_MIN_DELAY = int(os.getenv("APIFY_MIN_DELAY", "1"))
 APIFY_MAX_DELAY = int(os.getenv("APIFY_MAX_DELAY", "10"))
@@ -155,6 +178,12 @@ def send_job_to_miniapp(
 
 def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
     global FB_PARSER_DISABLED
+    global FB_COOKIES
+
+    # обновляем cookies динамически из miniapp (если есть)
+    latest = fetch_fb_cookies_from_miniapp()
+    if latest:
+        FB_COOKIES = latest
 
     if FB_PARSER_DISABLED:
         logger.warning("⛔ FB парсер отключён из-за невалидных cookies")
@@ -164,6 +193,13 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
         f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
         f"?token={APIFY_TOKEN}"
     )
+
+    if not FB_COOKIES:
+        send_alert(
+            "FB парсер: cookies не заданы.\n"
+            "Открой миниапп → ⚙️ Настройки → Аккаунты → Facebook cookies и вставь JSON."
+        )
+        return []
 
     actor_input = {
         "cookie": FB_COOKIES,
@@ -202,7 +238,7 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
             send_alert(
                 "❌ Facebook cookies протухли.\n"
                 "FB парсер автоматически остановлен.\n\n"
-                "Обнови cookies и сделай redeploy."
+                "Обнови cookies в миниаппе: ⚙️ Настройки → Аккаунты → Facebook cookies."
             )
             return []
 
