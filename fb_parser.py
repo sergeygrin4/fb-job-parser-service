@@ -108,12 +108,21 @@ def is_today(created_at) -> bool:
 
 def get_fb_groups() -> List[str]:
     """
-    Забираем список FB-групп из miniapp.
+    Забираем список групп из miniapp и приводим к корректным FB-URL.
 
-    API сейчас отдаёт:
-      {"groups": [{"id": ..., "group_id": "...", "enabled": true, ...}, ...]}
-
-    group_id может быть как полным URL, так и просто ID группы.
+    Сейчас /api/fb_groups возвращает:
+      {
+        "groups": [
+          {
+            "id": ...,
+            "group_id": "...",      # может быть ID, слаг или уже полный URL
+            "group_name": "...",
+            "enabled": true,
+            ...
+          },
+          ...
+        ]
+      }
     """
     try:
         logger.info("Запрашиваю FB-группы из %s", FB_GROUPS_API_URL)
@@ -126,28 +135,36 @@ def get_fb_groups() -> List[str]:
 
     urls: list[str] = []
 
-    # поддерживаем оба варианта ответа: dict {"groups": [...]} и просто список
     groups = data.get("groups", []) if isinstance(data, dict) else data
 
     for g in groups:
         if not g.get("enabled", True):
             continue
 
-        # сначала пробуем group_url (на будущее), потом group_id
         raw = (g.get("group_url") or g.get("group_id") or "").strip()
         if not raw:
             continue
 
-        # если это не URL, считаем что это ID группы и собираем URL
+        # если это телеграм – вообще не трогаем (для них есть tg-парсер)
+        if "t.me/" in raw or "telegram." in raw:
+            logger.debug("Пропускаю не-FB группу: %s", raw)
+            continue
+
+        # если уже полный URL – берём как есть
         if raw.startswith("http://") or raw.startswith("https://"):
             url = raw
         else:
-            url = f"https://facebook.com/groups/{raw}"
+            # поддержим варианты вида "@slug" или просто "slug/ID"
+            slug_or_id = raw.lstrip("@")
+            url = f"https://www.facebook.com/groups/{slug_or_id}"
 
         urls.append(url)
 
     logger.info("Найдено %d включённых FB-групп", len(urls))
+    for u in urls:
+        logger.info("  • %s", u)
     return urls
+
 
 
 
