@@ -19,16 +19,38 @@ API_BASE_URL = (os.getenv("API_BASE_URL") or "").rstrip("/")
 if not API_BASE_URL:
     raise RuntimeError("API_BASE_URL is not set")
 
-API_SECRET = os.getenv("API_SECRET", "")
 
-FB_GROUPS_API_URL = os.getenv(
-    "FB_GROUPS_API_URL",
-    f"{API_BASE_URL}/api/fb_groups",
-)
+def _get_api_secret() -> str:
+    """
+    Shared secret between parsers and miniapp.
+    Supports multiple env names to avoid misconfig in deploy platforms.
+    """
+    return (
+        os.getenv("API_SECRET")
+        or os.getenv("MINIAPP_API_SECRET")
+        or os.getenv("X_API_KEY")
+        or os.getenv("PARSER_API_SECRET")
+        or ""
+    ).strip()
 
-APIFY_TOKEN = os.getenv("APIFY_TOKEN")
-APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "AtBpiepuIUNs2k2ku")
 
+API_SECRET = _get_api_secret()
+
+FB_GROUPS_API_URL = os.getenv("FB_GROUPS_API_URL", f"{API_BASE_URL}/api/fb_groups")
+
+
+def _normalize_apify_token(token: str | None) -> str:
+    token = (token or "").strip()
+    if not token:
+        return ""
+    # If someone pasted a full URL, try to extract token=...
+    if ("http://" in token or "https://" in token) and "token=" in token:
+        token = token.split("token=", 1)[1].split("&", 1)[0].strip()
+    return token
+
+
+APIFY_TOKEN = _normalize_apify_token(os.getenv("APIFY_TOKEN"))
+APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "AtBpiepuIUNs2k2ku")  # можно username~actorname
 if not APIFY_TOKEN:
     raise RuntimeError("APIFY_TOKEN is not set")
 
@@ -37,29 +59,55 @@ FB_COOKIES_JSON = os.getenv("FB_COOKIES_JSON", "[]")
 
 def _load_cookies_from_env() -> list:
     try:
-        return json.loads(FB_COOKIES_JSON)
+        parsed = json.loads(FB_COOKIES_JSON)
+        return parsed if isinstance(parsed, list) else []
     except Exception as e:
         logger.error("❌ Не удалось распарсить FB_COOKIES_JSON: %s", e)
         return []
 
 
 def fetch_fb_cookies_from_miniapp() -> list:
-    """Берём cookies из miniapp (parser_secrets), чтобы не делать redeploy."""
-    try:
-        url = f"{API_BASE_URL}/api/parser_secrets/fb_cookies_json"
-        r = requests.get(
+    """
+    Берём cookies из miniapp (parser_secrets), чтобы не делать redeploy.
+    Требует API_SECRET.
+    """
+    url = f"{API_BASE_URL}/api/parser_secrets/fb_cookies_json"
+
+    if not API_SECRET:
+        logger.warning(
+            "⚠️ API_SECRET не задан в окружении парсера — не могу забрать cookies из miniapp (%s)",
             url,
-            headers={"X-API-KEY": API_SECRET} if API_SECRET else {},
-            timeout=10,
         )
-        r.raise_for_status()
+        return []
+
+    headers = {
+        "X-API-KEY": API_SECRET,
+        # запасной вариант, если где-то режут кастомные заголовки
+        "Authorization": f"Bearer {API_SECRET}",
+    }
+
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code >= 400:
+            logger.error("❌ miniapp cookies HTTP %s: %s", r.status_code, r.text[:1000])
+            return []
+
         data = r.json() or {}
         value = data.get("value")
         if not value:
+            logger.warning("⚠️ miniapp вернул пустые cookies (value is empty)")
             return []
+
         parsed = json.loads(value)
-        return parsed if isinstance(parsed, list) else []
-    except Exception:
+        if not isinstance(parsed, list):
+            logger.error("❌ miniapp cookies value не является JSON-массивом (type=%s)", type(parsed).__name__)
+            return []
+
+        logger.info("✅ cookies получены из miniapp: %d шт.", len(parsed))
+        return parsed
+
+    except Exception as e:
+        logger.error("❌ Ошибка получения cookies из miniapp: %s", e)
         return []
 
 
@@ -88,14 +136,14 @@ def is_today(created_at) -> bool:
 
     s = str(created_at)
 
-    # сначала пробуем ISO-строку
+    # ISO-строка
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         return dt.date() == date.today()
     except Exception:
         pass
 
-    # потом — timestamp (сек/мс)
+    # timestamp (сек/мс)
     try:
         ts = float(s)
         if ts > 1e12:
@@ -109,20 +157,6 @@ def is_today(created_at) -> bool:
 def get_fb_groups() -> List[str]:
     """
     Забираем список групп из miniapp и приводим к корректным FB-URL.
-
-    Сейчас /api/fb_groups возвращает:
-      {
-        "groups": [
-          {
-            "id": ...,
-            "group_id": "...",      # может быть ID, слаг или уже полный URL
-            "group_name": "...",
-            "enabled": true,
-            ...
-          },
-          ...
-        ]
-      }
     """
     try:
         logger.info("Запрашиваю FB-группы из %s", FB_GROUPS_API_URL)
@@ -145,16 +179,13 @@ def get_fb_groups() -> List[str]:
         if not raw:
             continue
 
-        # если это телеграм – вообще не трогаем (для них есть tg-парсер)
+        # если это телеграм – пропускаем
         if "t.me/" in raw or "telegram." in raw:
-            logger.debug("Пропускаю не-FB группу: %s", raw)
             continue
 
-        # если уже полный URL – берём как есть
         if raw.startswith("http://") or raw.startswith("https://"):
             url = raw
         else:
-            # поддержим варианты вида "@slug" или просто "slug/ID"
             slug_or_id = raw.lstrip("@")
             url = f"https://www.facebook.com/groups/{slug_or_id}"
 
@@ -166,16 +197,23 @@ def get_fb_groups() -> List[str]:
     return urls
 
 
-
-
 def send_alert(text: str):
+    """
+    Алерт в miniapp (/api/alert).
+    miniapp теперь принимает и X-API-KEY, и Bearer.
+    """
     try:
+        headers = {}
+        if API_SECRET:
+            headers = {"X-API-KEY": API_SECRET, "Authorization": f"Bearer {API_SECRET}"}
+
         requests.post(
             f"{API_BASE_URL}/api/alert",
-            headers={"X-API-KEY": API_SECRET} if API_SECRET else {},
+            headers=headers,
             json={
+                "text": text,
+                "message": text,  # backward compat
                 "source": "fb_parser",
-                "message": text,
             },
             timeout=10,
         )
@@ -198,10 +236,9 @@ def send_job_to_miniapp(
     author_url: str | None,
 ):
     endpoint = f"{API_BASE_URL}/post"
-    headers = {
-        "Content-Type": "application/json",
-        "X-API-KEY": API_SECRET,
-    }
+    headers = {"Content-Type": "application/json"}
+    if API_SECRET:
+        headers["X-API-KEY"] = API_SECRET
 
     payload = {
         "source": "facebook",
@@ -214,12 +251,7 @@ def send_job_to_miniapp(
     }
 
     try:
-        requests.post(
-            endpoint,
-            json=payload,
-            headers=headers,
-            timeout=30,
-        ).raise_for_status()
+        requests.post(endpoint, json=payload, headers=headers, timeout=30).raise_for_status()
         logger.info("✅ Отправили пост в миниапп: %s", post_url)
     except Exception as e:
         logger.error("❌ Ошибка отправки поста в миниапп: %s", e)
@@ -229,13 +261,10 @@ def post_status(key: str, value: str):
     """Пинг статуса парсера в miniapp (/api/parser_status/<key>)."""
     try:
         url = f"{API_BASE_URL}/api/parser_status/{key}"
-        headers = {"X-API-KEY": API_SECRET} if API_SECRET else {}
-        requests.post(
-            url,
-            json={"value": value},
-            headers=headers,
-            timeout=10,
-        )
+        headers = {}
+        if API_SECRET:
+            headers = {"X-API-KEY": API_SECRET, "Authorization": f"Bearer {API_SECRET}"}
+        requests.post(url, json={"value": value}, headers=headers, timeout=10)
     except Exception:
         pass
 
@@ -255,10 +284,8 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
         logger.warning("⛔ FB парсер отключён из-за невалидных cookies")
         return []
 
-    endpoint = (
-        f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
-        f"?token={APIFY_TOKEN}"
-    )
+    endpoint = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
+    params = {"token": APIFY_TOKEN}
 
     if not FB_COOKIES:
         send_alert(
@@ -272,35 +299,33 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
         "maxDelay": APIFY_MAX_DELAY,
         "minDelay": APIFY_MIN_DELAY,
         "proxy": {"useApifyProxy": True},
+        # правильный формат для большинства версий actor'а
+        "scrapeGroupPosts": {"groupUrl": group_url},
+        # на случай форков, которые читают dot-notation
         "scrapeGroupPosts.groupUrl": group_url,
         "scrapeUntil": today_str(),
         "sortType": "new_posts",
     }
 
-    logger.info("▶️ Вызов Apify для группы %s", group_url)
+    logger.info("▶️ Вызов Apify для группы %s (cookies=%d)", group_url, len(FB_COOKIES or []))
 
     try:
-        resp = requests.post(endpoint, json=actor_input, timeout=600)
-        resp.raise_for_status()
+        resp = requests.post(endpoint, params=params, json=actor_input, timeout=600)
+        if resp.status_code >= 400:
+            logger.error("❌ Apify HTTP %s: %s", resp.status_code, resp.text[:1500])
+            resp.raise_for_status()
         data = resp.json()
     except Exception as e:
         logger.error("❌ Ошибка вызова Apify для %s: %s", group_url, e)
         send_alert(f"Ошибка Apify при запросе группы:\n{group_url}\n\n{e}")
         return []
 
+    # Если actor вернул dict с ошибкой авторизации cookies
     if isinstance(data, dict):
-        error_text = (
-            data.get("error")
-            or data.get("message")
-            or data.get("statusMessage")
-            or ""
-        )
-
+        error_text = (data.get("error") or data.get("message") or data.get("statusMessage") or "")
         if "failed to authorize with given cookies" in error_text.lower():
             FB_PARSER_DISABLED = True
-
             logger.error("❌ Facebook cookies протухли — парсер остановлен")
-
             send_alert(
                 "❌ Facebook cookies протухли.\n"
                 "FB парсер автоматически остановлен.\n\n"
@@ -326,7 +351,6 @@ def process_cycle():
     now_iso = datetime.utcnow().isoformat() + "Z"
 
     if not group_urls:
-        # Групп нет, но парсер жив — пингуем fb_last_ok, чтобы вотчдог не ругался.
         post_status("fb_last_ok", now_iso)
         return
 
@@ -357,7 +381,6 @@ def process_cycle():
                 author_url=author_url,
             )
 
-    # цикл успешно отработал — пингуем fb_last_ok
     post_status("fb_last_ok", now_iso)
 
 
