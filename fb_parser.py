@@ -107,6 +107,14 @@ def is_today(created_at) -> bool:
 
 
 def get_fb_groups() -> List[str]:
+    """
+    Забираем список FB-групп из miniapp.
+
+    API сейчас отдаёт:
+      {"groups": [{"id": ..., "group_id": "...", "enabled": true, ...}, ...]}
+
+    group_id может быть как полным URL, так и просто ID группы.
+    """
     try:
         logger.info("Запрашиваю FB-группы из %s", FB_GROUPS_API_URL)
         resp = requests.get(FB_GROUPS_API_URL, timeout=30)
@@ -117,15 +125,30 @@ def get_fb_groups() -> List[str]:
         return []
 
     urls: list[str] = []
-    for g in data.get("groups", []):
+
+    # поддерживаем оба варианта ответа: dict {"groups": [...]} и просто список
+    groups = data.get("groups", []) if isinstance(data, dict) else data
+
+    for g in groups:
         if not g.get("enabled", True):
             continue
-        url = (g.get("group_url") or "").strip()
-        if url:
-            urls.append(url)
+
+        # сначала пробуем group_url (на будущее), потом group_id
+        raw = (g.get("group_url") or g.get("group_id") or "").strip()
+        if not raw:
+            continue
+
+        # если это не URL, считаем что это ID группы и собираем URL
+        if raw.startswith("http://") or raw.startswith("https://"):
+            url = raw
+        else:
+            url = f"https://facebook.com/groups/{raw}"
+
+        urls.append(url)
 
     logger.info("Найдено %d включённых FB-групп", len(urls))
     return urls
+
 
 
 def send_alert(text: str):
