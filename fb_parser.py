@@ -204,45 +204,79 @@ def post_status(key: str, value: str):
 
 
 def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
-    global FB_PARSER_DISABLED, FB_COOKIES
+    global FB_PARSER_DISABLED
+    global FB_COOKIES
 
     latest = fetch_fb_cookies_from_miniapp()
     if latest:
         FB_COOKIES = latest
 
     if FB_PARSER_DISABLED:
+        logger.warning("⛔ FB парсер отключён из-за невалидных cookies")
         return []
 
     endpoint = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
     params = {"token": APIFY_TOKEN}
 
     if not FB_COOKIES:
-        send_alert("FB парсер: cookies не заданы (нужен parser_secrets fb_cookies_json).")
+        send_alert(
+            "FB парсер: cookies не заданы.\n"
+            "Открой миниапп → ⚙️ Настройки → Аккаунты → Facebook cookies и вставь JSON."
+        )
         return []
 
     actor_input = {
+        # ВАЖНО: это зависит от конкретного Apify actor.
+        # Если actor ждёт другие поля — будет 400.
         "cookie": FB_COOKIES,
         "maxDelay": APIFY_MAX_DELAY,
         "minDelay": APIFY_MIN_DELAY,
         "proxy": {"useApifyProxy": True},
-        "scrapeGroupPosts": {"groupUrl": group_url},
-        "scrapeUntil": today_str(),
-        "sortType": "new_posts",
+        # самый частый формат для group posts:
+        "groupUrls": [group_url],
+        "maxItems": 30,
+        "resultsLimit": 30,
+        "sort": "NEWEST",
     }
+
+    logger.info("▶️ Apify call group=%s actor=%s cookies=%d", group_url, APIFY_ACTOR_ID, len(FB_COOKIES or []))
 
     try:
         resp = requests.post(endpoint, params=params, json=actor_input, timeout=600)
-        resp.raise_for_status()
+
+        if resp.status_code >= 400:
+            # покажем тело ошибки максимально понятно
+            body = resp.text[:2000]
+            try:
+                j = resp.json()
+                body = json.dumps(j, ensure_ascii=False)[:2000]
+            except Exception:
+                pass
+
+            msg = (
+                f"Ошибка Apify:\n{group_url}\n"
+                f"HTTP {resp.status_code}\n"
+                f"{body}"
+            )
+            logger.error("❌ %s", msg)
+            send_alert(msg)
+            return []
+
         data = resp.json()
+
     except Exception as e:
-        send_alert(f"Ошибка Apify:\n{group_url}\n\n{e}")
+        logger.error("❌ Ошибка вызова Apify для %s: %s", group_url, e)
+        send_alert(f"Ошибка Apify при запросе группы:\n{group_url}\n\n{e}")
         return []
 
     if isinstance(data, list):
         return data
     if isinstance(data, dict) and "items" in data:
         return data["items"]
+
+    logger.warning("Неожиданный формат ответа Apify: %r", data)
     return []
+
 
 
 def process_cycle():
