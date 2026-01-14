@@ -21,10 +21,6 @@ if not API_BASE_URL:
 
 
 def _get_api_secret() -> str:
-    """
-    Shared secret between parsers and miniapp.
-    Supports multiple env names to avoid misconfig in deploy platforms.
-    """
     return (
         os.getenv("API_SECRET")
         or os.getenv("MINIAPP_API_SECRET")
@@ -43,14 +39,13 @@ def _normalize_apify_token(token: str | None) -> str:
     token = (token or "").strip()
     if not token:
         return ""
-    # If someone pasted a full URL, try to extract token=...
     if ("http://" in token or "https://" in token) and "token=" in token:
         token = token.split("token=", 1)[1].split("&", 1)[0].strip()
     return token
 
 
 APIFY_TOKEN = _normalize_apify_token(os.getenv("APIFY_TOKEN"))
-APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "AtBpiepuIUNs2k2ku")  # можно username~actorname
+APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "AtBpiepuIUNs2k2ku")
 if not APIFY_TOKEN:
     raise RuntimeError("APIFY_TOKEN is not set")
 
@@ -74,15 +69,11 @@ def fetch_fb_cookies_from_miniapp() -> list:
     url = f"{API_BASE_URL}/api/parser_secrets/fb_cookies_json"
 
     if not API_SECRET:
-        logger.warning(
-            "⚠️ API_SECRET не задан в окружении парсера — не могу забрать cookies из miniapp (%s)",
-            url,
-        )
+        logger.warning("⚠️ API_SECRET не задан — не могу забрать cookies из miniapp (%s)", url)
         return []
 
     headers = {
         "X-API-KEY": API_SECRET,
-        # запасной вариант, если где-то режут кастомные заголовки
         "Authorization": f"Bearer {API_SECRET}",
     }
 
@@ -100,7 +91,7 @@ def fetch_fb_cookies_from_miniapp() -> list:
 
         parsed = json.loads(value)
         if not isinstance(parsed, list):
-            logger.error("❌ miniapp cookies value не является JSON-массивом (type=%s)", type(parsed).__name__)
+            logger.error("❌ miniapp cookies value не JSON-массив (type=%s)", type(parsed).__name__)
             return []
 
         logger.info("✅ cookies получены из miniapp: %d шт.", len(parsed))
@@ -111,7 +102,6 @@ def fetch_fb_cookies_from_miniapp() -> list:
         return []
 
 
-# initial cookies (fallback)
 FB_COOKIES = fetch_fb_cookies_from_miniapp() or _load_cookies_from_env()
 
 APIFY_MIN_DELAY = int(os.getenv("APIFY_MIN_DELAY", "1"))
@@ -119,12 +109,8 @@ APIFY_MAX_DELAY = int(os.getenv("APIFY_MAX_DELAY", "10"))
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "600"))
 
 _seen_hashes: set[str] = set()
-
-# ⛔ флаг автостопа
 FB_PARSER_DISABLED = False
 
-
-# ---------- УТИЛИТЫ ----------
 
 def today_str() -> str:
     return date.today().isoformat()
@@ -136,14 +122,12 @@ def is_today(created_at) -> bool:
 
     s = str(created_at)
 
-    # ISO-строка
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         return dt.date() == date.today()
     except Exception:
         pass
 
-    # timestamp (сек/мс)
     try:
         ts = float(s)
         if ts > 1e12:
@@ -157,6 +141,7 @@ def is_today(created_at) -> bool:
 def get_fb_groups() -> List[str]:
     """
     Забираем список групп из miniapp и приводим к корректным FB-URL.
+    Ожидаем {"groups":[{"group_id":"..."}, ...]} (как в /api/groups).
     """
     try:
         logger.info("Запрашиваю FB-группы из %s", FB_GROUPS_API_URL)
@@ -168,7 +153,6 @@ def get_fb_groups() -> List[str]:
         return []
 
     urls: list[str] = []
-
     groups = data.get("groups", []) if isinstance(data, dict) else data
 
     for g in groups:
@@ -179,7 +163,6 @@ def get_fb_groups() -> List[str]:
         if not raw:
             continue
 
-        # если это телеграм – пропускаем
         if "t.me/" in raw or "telegram." in raw:
             continue
 
@@ -198,10 +181,7 @@ def get_fb_groups() -> List[str]:
 
 
 def send_alert(text: str):
-    """
-    Алерт в miniapp (/api/alert).
-    miniapp теперь принимает и X-API-KEY, и Bearer.
-    """
+    """Алерт в miniapp (/api/alert)."""
     try:
         headers = {}
         if API_SECRET:
@@ -210,11 +190,7 @@ def send_alert(text: str):
         requests.post(
             f"{API_BASE_URL}/api/alert",
             headers=headers,
-            json={
-                "text": text,
-                "message": text,  # backward compat
-                "source": "fb_parser",
-            },
+            json={"text": text, "message": text, "source": "fb_parser"},
             timeout=10,
         )
     except Exception:
@@ -239,6 +215,7 @@ def send_job_to_miniapp(
     headers = {"Content-Type": "application/json"}
     if API_SECRET:
         headers["X-API-KEY"] = API_SECRET
+        headers["Authorization"] = f"Bearer {API_SECRET}"
 
     payload = {
         "source": "facebook",
@@ -269,13 +246,10 @@ def post_status(key: str, value: str):
         pass
 
 
-# ---------- APIFY ----------
-
 def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
     global FB_PARSER_DISABLED
     global FB_COOKIES
 
-    # обновляем cookies динамически из miniapp (если есть)
     latest = fetch_fb_cookies_from_miniapp()
     if latest:
         FB_COOKIES = latest
@@ -299,9 +273,7 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
         "maxDelay": APIFY_MAX_DELAY,
         "minDelay": APIFY_MIN_DELAY,
         "proxy": {"useApifyProxy": True},
-        # правильный формат для большинства версий actor'а
         "scrapeGroupPosts": {"groupUrl": group_url},
-        # на случай форков, которые читают dot-notation
         "scrapeGroupPosts.groupUrl": group_url,
         "scrapeUntil": today_str(),
         "sortType": "new_posts",
@@ -320,7 +292,6 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
         send_alert(f"Ошибка Apify при запросе группы:\n{group_url}\n\n{e}")
         return []
 
-    # Если actor вернул dict с ошибкой авторизации cookies
     if isinstance(data, dict):
         error_text = (data.get("error") or data.get("message") or data.get("statusMessage") or "")
         if "failed to authorize with given cookies" in error_text.lower():
@@ -335,7 +306,6 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
 
     if isinstance(data, list):
         return data
-
     if isinstance(data, dict) and "items" in data:
         return data["items"]
 
@@ -343,10 +313,7 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
     return []
 
 
-# ---------- ОСНОВНОЙ ЦИКЛ ----------
-
 def process_cycle():
-    """Один цикл: пройтись по всем группам и отправить свежие посты в миниапп."""
     group_urls = get_fb_groups()
     now_iso = datetime.utcnow().isoformat() + "Z"
 
