@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Optional
 
 import requests
 
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - fb_parser - %(levelname)s - %(message)s",
@@ -34,7 +35,6 @@ def _get_api_secret() -> str:
 
 API_SECRET = _get_api_secret()
 
-# ✅ по умолчанию берём единый список источников /api/groups
 FB_GROUPS_API_URL = os.getenv("FB_GROUPS_API_URL") or f"{API_BASE_URL}/api/groups"
 
 
@@ -42,6 +42,7 @@ def _normalize_apify_token(token: Optional[str]) -> str:
     token = (token or "").strip()
     if not token:
         return ""
+    # If someone pasted a full URL with token=...
     if ("http://" in token or "https://" in token) and "token=" in token:
         token = token.split("token=", 1)[1].split("&", 1)[0].strip()
     return token
@@ -52,25 +53,20 @@ APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "AtBpiepuIUNs2k2ku")
 if not APIFY_TOKEN:
     raise RuntimeError("APIFY_TOKEN is not set")
 
-# Actor settings
 APIFY_MIN_DELAY = int(os.getenv("APIFY_MIN_DELAY", "1"))
 APIFY_MAX_DELAY = int(os.getenv("APIFY_MAX_DELAY", "10"))
 APIFY_COUNT = int(os.getenv("APIFY_COUNT", "30"))
 APIFY_SORT_TYPE = (os.getenv("APIFY_SORT_TYPE") or "new_posts").strip()
 APIFY_TIMEOUT_SECONDS = int(os.getenv("APIFY_TIMEOUT_SECONDS", "600"))
 
-# Optional: ограничение по дате (если пусто — не отправляем поле вообще)
+# Optional
 APIFY_SCRAPE_UNTIL = (os.getenv("APIFY_SCRAPE_UNTIL") or "").strip()
-
-# Optional proxy country
 APIFY_PROXY_COUNTRY = (os.getenv("APIFY_PROXY_COUNTRY") or "").strip()
 
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "600"))
 
-# cookies can be set either via miniapp secret or env
 FB_COOKIES_JSON = os.getenv("FB_COOKIES_JSON", "[]")
 
-# enable/disable parser from env
 FB_PARSER_DISABLED = (os.getenv("FB_PARSER_DISABLED") or "").strip().lower() in ("1", "true", "yes", "y")
 
 _seen_hashes: set[str] = set()
@@ -100,9 +96,9 @@ def fetch_fb_cookies_from_miniapp() -> list:
     """
     miniapp endpoint: GET /api/parser_secrets/fb_cookies_json -> {"value": "<json string>"}
     """
-    url = f"{API_BASE_URL}/api/parser_secrets/fb_cookies_json"
     if not API_SECRET:
         return []
+    url = f"{API_BASE_URL}/api/parser_secrets/fb_cookies_json"
     try:
         r = requests.get(url, headers=_auth_headers(), timeout=10)
         if r.status_code >= 400:
@@ -118,10 +114,6 @@ def fetch_fb_cookies_from_miniapp() -> list:
 
 
 FB_COOKIES = fetch_fb_cookies_from_miniapp() or _load_cookies_from_env()
-
-
-def today_str() -> str:
-    return date.today().isoformat()
 
 
 def is_today(created_at: Any) -> bool:
@@ -149,9 +141,7 @@ def is_today(created_at: Any) -> bool:
 
 def get_fb_groups() -> List[str]:
     """
-    Поддерживаем:
-      - /api/groups -> {"groups":[{"group_id": "...", "group_url": "...", "type":"facebook"}, ...]}
-      - /api/fb_groups -> {"items":[{"link":"..."}, ...]}
+    /api/groups -> {"groups":[{"group_id": "...", "group_url": "...", "type":"facebook"}, ...]}
     """
     try:
         resp = requests.get(FB_GROUPS_API_URL, headers=_auth_headers(), timeout=30)
@@ -162,7 +152,6 @@ def get_fb_groups() -> List[str]:
         return []
 
     urls: list[str] = []
-
     if isinstance(data, dict) and "groups" in data:
         for g in (data.get("groups") or []):
             if not isinstance(g, dict):
@@ -173,15 +162,7 @@ def get_fb_groups() -> List[str]:
             if t and t != "facebook":
                 continue
             raw = (g.get("group_url") or g.get("group_id") or "").strip()
-            if raw and "t.me/" not in raw:
-                urls.append(raw)
-
-    elif isinstance(data, dict) and "items" in data:
-        for it in (data.get("items") or []):
-            if not isinstance(it, dict):
-                continue
-            raw = (it.get("link") or "").strip()
-            if raw and "t.me/" not in raw:
+            if raw:
                 urls.append(raw)
 
     norm_urls: list[str] = []
@@ -206,7 +187,19 @@ def send_alert(text: str) -> None:
         pass
 
 
-def hash_post(text: str, url: Optional[str]) -> str:
+def post_status(key: str, value: str) -> None:
+    try:
+        requests.post(
+            f"{API_BASE_URL}/api/parser_status/{key}",
+            json={"value": value},
+            headers=_auth_headers(),
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def _post_hash(text: str, url: Optional[str]) -> str:
     base = (text or "").strip()
     if url:
         base += f"::{url}"
@@ -223,7 +216,7 @@ def send_job_to_miniapp(
     payload = {
         "source": "facebook",
         "source_name": group_url or "facebook_group",
-        "external_id": post_url or created_at or hash_post(text, None),
+        "external_id": post_url or created_at or _post_hash(text, None),
         "url": post_url,
         "text": text,
         "sender_username": author_url,
@@ -235,18 +228,6 @@ def send_job_to_miniapp(
         headers=_auth_headers(),
         timeout=30,
     ).raise_for_status()
-
-
-def post_status(key: str, value: str) -> None:
-    try:
-        requests.post(
-            f"{API_BASE_URL}/api/parser_status/{key}",
-            json={"value": value},
-            headers=_auth_headers(),
-            timeout=10,
-        )
-    except Exception:
-        pass
 
 
 # -----------------------------
@@ -265,31 +246,33 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
         FB_COOKIES = latest
 
     if not FB_COOKIES:
-        send_alert(
+        msg = (
             "FB парсер: cookies не заданы.\n"
             "Открой миниапп → ⚙️ Настройки → Аккаунты → Facebook cookies и вставь JSON."
         )
+        logger.error(msg)
+        send_alert(msg)
         return []
 
     endpoint = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
     params = {"token": APIFY_TOKEN}
 
-actor_input: Dict[str, Any] = {
-    "cookie": FB_COOKIES,
-    "minDelay": APIFY_MIN_DELAY,
-    "maxDelay": APIFY_MAX_DELAY,
-    "proxy": {"useApifyProxy": True},
-    "scrapeGroupPosts.groupUrl": group_url,  # ✅ ВАЖНО: именно так, с точкой
-    "sortType": APIFY_SORT_TYPE,
-    "count": APIFY_COUNT,
-}
+    # ✅ ВАЖНО: этот Actor ожидает dotted-key (как у тебя в schema)
+    actor_input: Dict[str, Any] = {
+        "cookie": FB_COOKIES,
+        "minDelay": APIFY_MIN_DELAY,
+        "maxDelay": APIFY_MAX_DELAY,
+        "proxy": {"useApifyProxy": True},
+        "scrapeGroupPosts.groupUrl": group_url,  # REQUIRED (dotted key)
+        "sortType": APIFY_SORT_TYPE,
+        "count": APIFY_COUNT,
+    }
 
-if APIFY_PROXY_COUNTRY:
-    actor_input["proxy"]["apifyProxyCountry"] = APIFY_PROXY_COUNTRY
+    if APIFY_PROXY_COUNTRY:
+        actor_input["proxy"]["apifyProxyCountry"] = APIFY_PROXY_COUNTRY
 
-if APIFY_SCRAPE_UNTIL:
-    actor_input["scrapeUntil"] = APIFY_SCRAPE_UNTIL
-
+    if APIFY_SCRAPE_UNTIL:
+        actor_input["scrapeUntil"] = APIFY_SCRAPE_UNTIL
 
     logger.info(
         "▶️ Apify call group=%s actor=%s cookies=%d count=%s sortType=%s",
@@ -304,28 +287,33 @@ if APIFY_SCRAPE_UNTIL:
         resp = requests.post(
             endpoint,
             params=params,
-            json=actor_input,  # ВАЖНО: без {"input": ...}
+            json=actor_input,
             timeout=APIFY_TIMEOUT_SECONDS,
         )
-
-        if resp.status_code >= 400:
-            body = resp.text[:2000]
-            try:
-                j = resp.json()
-                body = json.dumps(j, ensure_ascii=False)[:2000]
-            except Exception:
-                pass
-
-            msg = f"Ошибка Apify:\n{group_url}\nHTTP {resp.status_code}\n{body}"
-            logger.error("❌ %s", msg)
-            send_alert(msg)
-            return []
-
-        data = resp.json()
-
     except Exception as e:
         logger.error("❌ Ошибка вызова Apify для %s: %s", group_url, e)
         send_alert(f"Ошибка Apify при запросе группы:\n{group_url}\n\n{e}")
+        return []
+
+    if resp.status_code >= 400:
+        # Печатаем тело ошибки — без этого ты не увидишь реальную причину 400
+        body = resp.text[:2000]
+        try:
+            body = json.dumps(resp.json(), ensure_ascii=False)[:2000]
+        except Exception:
+            pass
+
+        msg = f"Ошибка Apify:\n{group_url}\nHTTP {resp.status_code}\n{body}"
+        logger.error("❌ %s", msg)
+        send_alert(msg)
+        return []
+
+    try:
+        data = resp.json()
+    except Exception:
+        msg = f"Ошибка Apify: не JSON ответ\n{group_url}\nHTTP {resp.status_code}\n{resp.text[:2000]}"
+        logger.error("❌ %s", msg)
+        send_alert(msg)
         return []
 
     if isinstance(data, list):
@@ -359,7 +347,7 @@ def process_cycle() -> None:
             post_url = item.get("url")
             created_at = item.get("createdAt")
 
-            # фильтруем только сегодняшние
+            # только сегодняшние
             if not is_today(created_at):
                 continue
 
@@ -368,7 +356,7 @@ def process_cycle() -> None:
             if isinstance(user_obj, dict):
                 author_url = user_obj.get("url")
 
-            h = hash_post(text, post_url)
+            h = _post_hash(text, post_url)
             if h in _seen_hashes:
                 continue
             _seen_hashes.add(h)
