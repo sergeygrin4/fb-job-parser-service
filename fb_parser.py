@@ -225,18 +225,22 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
         )
         return []
 
-    actor_input = {
-        # ВАЖНО: это зависит от конкретного Apify actor.
-        # Если actor ждёт другие поля — будет 400.
-        "cookie": FB_COOKIES,
-        "maxDelay": APIFY_MAX_DELAY,
+actor_input = {
+        # Actor: curious_coder/facebook-post-scraper (ID AtBpiepuIUNs2k2ku)
+        # Schema: cookie (optional), scrapeGroupPosts.groupUrl (required), proxy (required), sortType, minDelay/maxDelay...
+        "cookie": FB_COOKIES,  # optional, but needed for member/private groups
+        "scrapeGroupPosts": {"groupUrl": group_url},  # REQUIRED
+        "sortType": "new_posts",  # options: most_relevant | recent_activity | new_posts
+        "count": 30,  # how many records you want (optional)
+        "cursor": "",  # optional resume
+        "scrapeUntil": "",  # optional: only newer than date
         "minDelay": APIFY_MIN_DELAY,
-        "proxy": {"useApifyProxy": True},
-        # самый частый формат для group posts:
-        "groupUrls": [group_url],
-        "maxItems": 30,
-        "resultsLimit": 30,
-        "sort": "NEWEST",
+        "maxDelay": APIFY_MAX_DELAY,
+        "proxy": {
+            "useApifyProxy": True,
+            # часто нужно указать страну под аккаунт (если FB ругается):
+            # "apifyProxyCountry": "NL",
+        },
     }
 
     logger.info("▶️ Apify call group=%s actor=%s cookies=%d", group_url, APIFY_ACTOR_ID, len(FB_COOKIES or []))
