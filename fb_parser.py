@@ -274,24 +274,22 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
     endpoint = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
     params = {"token": APIFY_TOKEN}
 
-    # ✅ КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ:
-    # НЕ "scrapeGroupPosts.groupUrl": "...", а вложенно:
-    # "scrapeGroupPosts": {"groupUrl": "..."}
-    actor_input: Dict[str, Any] = {
-        "cookie": FB_COOKIES,
-        "minDelay": APIFY_MIN_DELAY,
-        "maxDelay": APIFY_MAX_DELAY,
-        "proxy": {"useApifyProxy": True},
-        "scrapeGroupPosts": {"groupUrl": group_url},  # REQUIRED
-        "sortType": APIFY_SORT_TYPE,
-        "count": APIFY_COUNT,
-    }
+actor_input: Dict[str, Any] = {
+    "cookie": FB_COOKIES,
+    "minDelay": APIFY_MIN_DELAY,
+    "maxDelay": APIFY_MAX_DELAY,
+    "proxy": {"useApifyProxy": True},
+    "scrapeGroupPosts.groupUrl": group_url,  # ✅ ВАЖНО: именно так, с точкой
+    "sortType": APIFY_SORT_TYPE,
+    "count": APIFY_COUNT,
+}
 
-    if APIFY_PROXY_COUNTRY:
-        actor_input["proxy"]["apifyProxyCountry"] = APIFY_PROXY_COUNTRY  # type: ignore[index]
+if APIFY_PROXY_COUNTRY:
+    actor_input["proxy"]["apifyProxyCountry"] = APIFY_PROXY_COUNTRY
 
-    if APIFY_SCRAPE_UNTIL:
-        actor_input["scrapeUntil"] = APIFY_SCRAPE_UNTIL
+if APIFY_SCRAPE_UNTIL:
+    actor_input["scrapeUntil"] = APIFY_SCRAPE_UNTIL
+
 
     logger.info(
         "▶️ Apify call group=%s actor=%s cookies=%d count=%s sortType=%s",
