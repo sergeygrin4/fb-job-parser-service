@@ -354,16 +354,16 @@ def process_cycle() -> None:
 
             text = item.get("text") or ""
             post_url = item.get("url")
-            created_at = item.get("createdAt")
+created_at = item.get("createdAt")
 
-            # только сегодняшние
-            if FB_ONLY_TODAY and not is_today(created_at):
+# только сегодняшние
+if FB_ONLY_TODAY and not is_today(created_at):
     continue
 
-            author_url: Optional[str] = None
-            user_obj = item.get("user")
-            if isinstance(user_obj, dict):
-                author_url = user_obj.get("url")
+author_url: Optional[str] = None
+user_obj = item.get("user")
+if isinstance(user_obj, dict):
+    author_url = user_obj.get("url")
 
             h = _post_hash(text, post_url)
             if h in _seen_hashes:
