@@ -224,19 +224,16 @@ def send_job_to_miniapp(
     }
 
     url = f"{API_BASE_URL}/post"
-    try:
-        r = requests.post(url, json=payload, headers=_auth_headers(), timeout=30)
-        if r.status_code != 200:
-            logger.error("❌ /post failed: %s %s", r.status_code, r.text[:500])
-            raise RuntimeError(f"post failed {r.status_code}")
-        logger.info("✅ /post ok: %s", r.text[:200])
-    except Exception as e:
-        logger.error("❌ Ошибка отправки в miniapp: %s", e)
-        try:
-            send_alert(f"FB parser: не удалось отправить пост в miniapp\n{e}")
-        except Exception:
-            pass
-        raise
+    r = requests.post(url, json=payload, headers=_auth_headers(), timeout=30)
+
+    if r.status_code != 200:
+        logger.error("❌ /post failed: http=%s body=%s", r.status_code, r.text[:800])
+        # алерт в миниапп, чтобы не искать в логах
+        send_alert(f"FB parser: /post failed\nHTTP {r.status_code}\n{r.text[:800]}")
+        r.raise_for_status()
+
+    logger.info("✅ /post ok: %s", r.text[:200])
+
 
 
 
@@ -356,10 +353,11 @@ def process_cycle() -> None:
             text = item.get("text") or ""
             post_url = item.get("url")
             created_at = item.get("createdAt")
+            FB_ONLY_TODAY = (os.getenv("FB_ONLY_TODAY") or "true").strip().lower() in ("1", "true", "yes", "y")
 
             # только сегодняшние
-            if not is_today(created_at):
-                continue
+            if FB_ONLY_TODAY and not is_today(created_at):
+    continue
 
             author_url: Optional[str] = None
             user_obj = item.get("user")
