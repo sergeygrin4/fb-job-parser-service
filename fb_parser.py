@@ -222,12 +222,22 @@ def send_job_to_miniapp(
         "sender_username": author_url,
         "created_at": created_at,
     }
-    requests.post(
-        f"{API_BASE_URL}/post",
-        json=payload,
-        headers=_auth_headers(),
-        timeout=30,
-    ).raise_for_status()
+
+    url = f"{API_BASE_URL}/post"
+    try:
+        r = requests.post(url, json=payload, headers=_auth_headers(), timeout=30)
+        if r.status_code != 200:
+            logger.error("❌ /post failed: %s %s", r.status_code, r.text[:500])
+            raise RuntimeError(f"post failed {r.status_code}")
+        logger.info("✅ /post ok: %s", r.text[:200])
+    except Exception as e:
+        logger.error("❌ Ошибка отправки в miniapp: %s", e)
+        try:
+            send_alert(f"FB parser: не удалось отправить пост в miniapp\n{e}")
+        except Exception:
+            pass
+        raise
+
 
 
 # -----------------------------
