@@ -230,13 +230,10 @@ def send_job_to_miniapp(
 
     if r.status_code != 200:
         logger.error("❌ /post failed: http=%s body=%s", r.status_code, r.text[:800])
-        # алерт в миниапп, чтобы не искать в логах
         send_alert(f"FB parser: /post failed\nHTTP {r.status_code}\n{r.text[:800]}")
         r.raise_for_status()
 
     logger.info("✅ /post ok: %s", r.text[:200])
-
-
 
 
 # -----------------------------
@@ -305,7 +302,6 @@ def call_apify_for_group(group_url: str) -> List[Dict[str, Any]]:
         return []
 
     if resp.status_code >= 400:
-        # Печатаем тело ошибки — без этого ты не увидишь реальную причину 400
         body = resp.text[:2000]
         try:
             body = json.dumps(resp.json(), ensure_ascii=False)[:2000]
@@ -354,16 +350,16 @@ def process_cycle() -> None:
 
             text = item.get("text") or ""
             post_url = item.get("url")
-created_at = item.get("createdAt")
+            created_at = item.get("createdAt")
 
-# только сегодняшние
-if FB_ONLY_TODAY and not is_today(created_at):
-    continue
+            # только сегодняшние (можно отключить: FB_ONLY_TODAY=false)
+            if FB_ONLY_TODAY and not is_today(created_at):
+                continue
 
-author_url: Optional[str] = None
-user_obj = item.get("user")
-if isinstance(user_obj, dict):
-    author_url = user_obj.get("url")
+            author_url: Optional[str] = None
+            user_obj = item.get("user")
+            if isinstance(user_obj, dict):
+                author_url = user_obj.get("url")
 
             h = _post_hash(text, post_url)
             if h in _seen_hashes:
