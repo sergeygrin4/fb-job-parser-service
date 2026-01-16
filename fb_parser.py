@@ -37,6 +37,8 @@ API_SECRET = _get_api_secret()
 
 FB_GROUPS_API_URL = os.getenv("FB_GROUPS_API_URL") or f"{API_BASE_URL}/api/groups"
 
+FB_ONLY_TODAY = (os.getenv("FB_ONLY_TODAY") or "true").strip().lower() in ("1", "true", "yes", "y")
+
 
 def _normalize_apify_token(token: Optional[str]) -> str:
     token = (token or "").strip()
@@ -353,7 +355,6 @@ def process_cycle() -> None:
             text = item.get("text") or ""
             post_url = item.get("url")
             created_at = item.get("createdAt")
-            FB_ONLY_TODAY = (os.getenv("FB_ONLY_TODAY") or "true").strip().lower() in ("1", "true", "yes", "y")
 
             # только сегодняшние
             if FB_ONLY_TODAY and not is_today(created_at):
