@@ -150,33 +150,59 @@ FB_COOKIES = fetch_fb_cookies_from_miniapp() or _load_cookies_from_env()
 
 def send_alert(text: str) -> None:
     try:
-        requests.post(
+        r = requests.post(
             f"{API_BASE_URL}/api/alert",
             headers=_auth_headers(),
             json={"text": text, "message": text, "source": "fb_parser"},
             timeout=10,
         )
+        if r.status_code >= 400:
+                logger.error("❌ /api/alert failed http=%s body=%s", r.status_code, r.text[:800])
     except Exception:
-        pass
+        logger.exception("❌ /api/alert exception")
 
 
 def post_status(key: str, value: str) -> None:
     try:
-        requests.post(
+        r = requests.post(
             f"{API_BASE_URL}/api/parser_status/{key}",
             json={"value": value},
             headers=_auth_headers(),
             timeout=10,
         )
+        if r.status_code >= 400:
+                logger.error("❌ /api/parser_status/%s failed http=%s body=%s", key, r.status_code, r.text[:800])
     except Exception:
-        pass
+        logger.exception("❌ /api/parser_status exception")
+
+def _looks_like_facebook(raw: str) -> bool:
+    """Heuristics to avoid feeding Telegram/other sources to FB parser.
+
+    miniapp stores sources in a single table, so /api/groups may contain Telegram ids/links.
+    """
+    s = (raw or "").strip().lower()
+    if not s:
+        return False
+    if s.startswith("@"):
+        return False
+    if "t.me/" in s or "telegram.me/" in s:
+        return False
+    if "facebook.com" in s or "fb.com" in s:
+        return True
+    # bare ids are allowed (e.g. 1234567890 or some slug) — accept them
+    return True
 
 
-def _post_hash(text: str, url: Optional[str]) -> str:
-    base = (text or "").strip()
-    if url:
-        base += f"::{url}"
-    return str(abs(hash(base)))
+ def _post_hash(text: str, url: Optional[str]) -> str:
+@@ -208,6 +230,8 @@
+         raw = (g.get("group_url") or g.get("group_id") or "").strip()
+         if not raw:
+             continue
+        if not _looks_like_facebook(raw):
+            continue
+         if raw.startswith("http://") or raw.startswith("https://"):
+             urls.append(raw)
+         else:
 
 
 def get_fb_groups() -> List[str]:
