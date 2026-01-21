@@ -80,7 +80,6 @@ APIFY_PROXY_COUNTRY = (os.getenv("APIFY_PROXY_COUNTRY") or "").strip()
 
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "600"))
 
-
 FB_COOKIES_JSON = os.getenv("FB_COOKIES_JSON", "[]")
 FB_PARSER_DISABLED = (os.getenv("FB_PARSER_DISABLED") or "").strip().lower() in ("1", "true", "yes", "y")
 
@@ -157,7 +156,7 @@ def send_alert(text: str) -> None:
             timeout=10,
         )
         if r.status_code >= 400:
-                logger.error("❌ /api/alert failed http=%s body=%s", r.status_code, r.text[:800])
+            logger.error("❌ /api/alert failed http=%s body=%s", r.status_code, r.text[:800])
     except Exception:
         logger.exception("❌ /api/alert exception")
 
@@ -171,9 +170,10 @@ def post_status(key: str, value: str) -> None:
             timeout=10,
         )
         if r.status_code >= 400:
-                logger.error("❌ /api/parser_status/%s failed http=%s body=%s", key, r.status_code, r.text[:800])
+            logger.error("❌ /api/parser_status/%s failed http=%s body=%s", key, r.status_code, r.text[:800])
     except Exception:
         logger.exception("❌ /api/parser_status exception")
+
 
 def _looks_like_facebook(raw: str) -> bool:
     """Heuristics to avoid feeding Telegram/other sources to FB parser.
@@ -193,16 +193,11 @@ def _looks_like_facebook(raw: str) -> bool:
     return True
 
 
- def _post_hash(text: str, url: Optional[str]) -> str:
-@@ -208,6 +230,8 @@
-         raw = (g.get("group_url") or g.get("group_id") or "").strip()
-         if not raw:
-             continue
-        if not _looks_like_facebook(raw):
-            continue
-         if raw.startswith("http://") or raw.startswith("https://"):
-             urls.append(raw)
-         else:
+def _post_hash(text: str, url: Optional[str]) -> str:
+    import hashlib
+
+    base = (text or "").strip() + "|" + (url or "")
+    return hashlib.sha256(base.encode("utf-8", "ignore")).hexdigest()
 
 
 def get_fb_groups() -> List[str]:
@@ -226,6 +221,7 @@ def get_fb_groups() -> List[str]:
             continue
         if not g.get("enabled", True):
             continue
+
         # If API returns type, ignore non-facebook
         t = (g.get("type") or "").lower().strip()
         if t and t != "facebook":
@@ -234,6 +230,11 @@ def get_fb_groups() -> List[str]:
         raw = (g.get("group_url") or g.get("group_id") or "").strip()
         if not raw:
             continue
+
+        # Extra filter (handles "unknown" and mixed sources)
+        if not _looks_like_facebook(raw):
+            continue
+
         if raw.startswith("http://") or raw.startswith("https://"):
             urls.append(raw)
         else:
