@@ -68,9 +68,9 @@ APIFY_ACTOR_ID = (os.getenv("APIFY_ACTOR_ID") or "AtBpiepuIUNs2k2ku").strip()
 if not APIFY_TOKEN:
     raise RuntimeError("APIFY_TOKEN is not set")
 
-APIFY_MIN_DELAY = int(os.getenv("APIFY_MIN_DELAY", "1"))
-APIFY_MAX_DELAY = int(os.getenv("APIFY_MAX_DELAY", "10"))
-APIFY_COUNT = int(os.getenv("APIFY_COUNT", "30"))
+APIFY_MIN_DELAY = int(os.getenv("APIFY_MIN_DELAY", "30"))
+APIFY_MAX_DELAY = int(os.getenv("APIFY_MAX_DELAY", "90"))
+APIFY_COUNT = int(os.getenv("APIFY_COUNT", "3"))
 APIFY_SORT_TYPE = (os.getenv("APIFY_SORT_TYPE") or "new_posts").strip()
 APIFY_TIMEOUT_SECONDS = int(os.getenv("APIFY_TIMEOUT_SECONDS", "600"))
 
