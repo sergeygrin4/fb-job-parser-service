@@ -1,5 +1,6 @@
 import os
 import time
+import random
 import json
 import logging
 from datetime import date, datetime
@@ -18,9 +19,23 @@ logger = logging.getLogger("fb_parser")
 # -----------------------------
 # Config / ENV
 # -----------------------------
-API_BASE_URL = (os.getenv("API_BASE_URL") or "").rstrip("/")
+def _env_first(*names: str, default: str = "") -> str:
+    for n in names:
+        v = os.getenv(n)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return default
+
+# IMPORTANT: miniapp url is stored in Railway variable `miniapp_url`.
+API_BASE_URL = _env_first(
+    "MINIAPP_URL",
+    "miniapp_url",
+    "API_BASE_URL",  # legacy
+    "API_URL",
+    default="",
+).rstrip("/")
 if not API_BASE_URL:
-    raise RuntimeError("API_BASE_URL is not set")
+    raise RuntimeError("miniapp_url/MINIAPP_URL is not set (URL of miniapp service)")
 
 
 def _get_api_secret() -> str:
@@ -78,7 +93,27 @@ APIFY_TIMEOUT_SECONDS = int(os.getenv("APIFY_TIMEOUT_SECONDS", "1200"))
 APIFY_SCRAPE_UNTIL = (os.getenv("APIFY_SCRAPE_UNTIL") or "").strip()
 APIFY_PROXY_COUNTRY = (os.getenv("APIFY_PROXY_COUNTRY") or "").strip()
 
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "600"))
+# Polling:
+# - If POLL_INTERVAL_SECONDS is set => fixed.
+# - Else => random between MIN/MAX (defaults 50-60 minutes).
+POLL_INTERVAL_SECONDS_RAW = (_env_first("POLL_INTERVAL_SECONDS", default="") or "").strip()
+POLL_INTERVAL_MIN_SECONDS = int(_env_first("POLL_INTERVAL_MIN_SECONDS", default="3000") or "3000")
+POLL_INTERVAL_MAX_SECONDS = int(_env_first("POLL_INTERVAL_MAX_SECONDS", default="3600") or "3600")
+
+def _next_sleep_seconds() -> int:
+    if POLL_INTERVAL_SECONDS_RAW:
+        try:
+            return max(1, int(POLL_INTERVAL_SECONDS_RAW))
+        except Exception:
+            return 3000
+    lo = max(1, int(POLL_INTERVAL_MIN_SECONDS))
+    hi = max(lo, int(POLL_INTERVAL_MAX_SECONDS))
+    return random.randint(lo, hi)
+
+def _poll_hint() -> str:
+    if POLL_INTERVAL_SECONDS_RAW:
+        return f"{_next_sleep_seconds()}s (fixed)"
+    return f"{POLL_INTERVAL_MIN_SECONDS}-{POLL_INTERVAL_MAX_SECONDS}s (jitter)"
 
 FB_COOKIES_JSON = os.getenv("FB_COOKIES_JSON", "[]")
 FB_PARSER_DISABLED = (os.getenv("FB_PARSER_DISABLED") or "").strip().lower() in ("1", "true", "yes", "y")
@@ -427,15 +462,20 @@ def process_cycle() -> None:
 
 
 def main() -> None:
-    logger.info("🚀 Запуск Facebook Job Parser через Apify")
+    logger.info("🚀 Запуск Facebook Job Parser через Apify (poll=%s)", _poll_hint())
     while True:
         try:
             process_cycle()
         except Exception as e:
             logger.error("❌ Критическая ошибка цикла: %s", e)
             send_alert(f"FB parser: critical error\n\n{e}")
-        time.sleep(POLL_INTERVAL_SECONDS)
+
+        sleep_s = _next_sleep_seconds()
+        logger.info("⏲️ sleep %ss (%s)", sleep_s, _poll_hint())
+        time.sleep(sleep_s)
 
 
 if __name__ == "__main__":
+
+
     main()
