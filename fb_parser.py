@@ -26,7 +26,9 @@ def _env_first(*names: str, default: str = "") -> str:
             return str(v).strip()
     return default
 
-# IMPORTANT: miniapp url is stored in Railway variable `miniapp_url`.
+
+# IMPORTANT:
+# miniapp url у тебя хранится в Railway variable `miniapp_url` (а BASE — это база с группами).
 API_BASE_URL = _env_first(
     "MINIAPP_URL",
     "miniapp_url",
@@ -94,11 +96,12 @@ APIFY_SCRAPE_UNTIL = (os.getenv("APIFY_SCRAPE_UNTIL") or "").strip()
 APIFY_PROXY_COUNTRY = (os.getenv("APIFY_PROXY_COUNTRY") or "").strip()
 
 # Polling:
-# - If POLL_INTERVAL_SECONDS is set => fixed.
-# - Else => random between MIN/MAX (defaults 50-60 minutes).
-POLL_INTERVAL_SECONDS_RAW = (_env_first("POLL_INTERVAL_SECONDS", default="") or "").strip()
+# - If POLL_INTERVAL_SECONDS is set => fixed
+# - Else => random between MIN/MAX (defaults 50–60 minutes)
+POLL_INTERVAL_SECONDS_RAW = _env_first("POLL_INTERVAL_SECONDS", default="").strip()
 POLL_INTERVAL_MIN_SECONDS = int(_env_first("POLL_INTERVAL_MIN_SECONDS", default="3000") or "3000")
 POLL_INTERVAL_MAX_SECONDS = int(_env_first("POLL_INTERVAL_MAX_SECONDS", default="3600") or "3600")
+
 
 def _next_sleep_seconds() -> int:
     if POLL_INTERVAL_SECONDS_RAW:
@@ -110,10 +113,12 @@ def _next_sleep_seconds() -> int:
     hi = max(lo, int(POLL_INTERVAL_MAX_SECONDS))
     return random.randint(lo, hi)
 
+
 def _poll_hint() -> str:
     if POLL_INTERVAL_SECONDS_RAW:
         return f"{_next_sleep_seconds()}s (fixed)"
     return f"{POLL_INTERVAL_MIN_SECONDS}-{POLL_INTERVAL_MAX_SECONDS}s (jitter)"
+
 
 FB_COOKIES_JSON = os.getenv("FB_COOKIES_JSON", "[]")
 FB_PARSER_DISABLED = (os.getenv("FB_PARSER_DISABLED") or "").strip().lower() in ("1", "true", "yes", "y")
@@ -471,11 +476,9 @@ def main() -> None:
             send_alert(f"FB parser: critical error\n\n{e}")
 
         sleep_s = _next_sleep_seconds()
-        logger.info("⏲️ sleep %ss (%s)", sleep_s, _poll_hint())
+        logger.info("⏲️ sleep %ss", sleep_s)
         time.sleep(sleep_s)
 
 
 if __name__ == "__main__":
-
-
     main()
